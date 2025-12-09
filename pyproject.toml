@@ -1,0 +1,18 @@
+[project]
+name = "pico-gpt-quantized"
+version = "0.1.0"
+requires-python = ">=3.8"
+dependencies = [
+    "torch>=2.0.0",
+    "numpy",
+    "tqdm",
+    "matplotlib",
+    "tiktoken"
+]
+
+[tool.uv]
+dev-dependencies = [
+    "wandb>=0.15.0",
+    "jupyter>=1.0.0",
+    "pytest>=7.0.0"
+]

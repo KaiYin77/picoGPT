@@ -1,7 +1,7 @@
 
 # picoGPT
 
-![nanoGPT](assets/nanogpt.jpg)
+![picoGPT](assets/picogpt.png)
 
 This repository now contains **Pico GPT** - a tiny quantized GPT implementation optimized for character-level text generation with int8 quantization support.
 

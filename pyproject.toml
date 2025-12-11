@@ -7,7 +7,8 @@ dependencies = [
     "numpy",
     "tqdm",
     "matplotlib",
-    "tiktoken"
+    "tiktoken",
+    "html2text>=2024.2.26",
 ]
 
 [tool.uv]

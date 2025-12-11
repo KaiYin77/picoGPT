@@ -10,15 +10,15 @@ import torch
 import tiktoken
 from contextlib import nullcontext
 
-from pico_model import PicoGPTConfig, PicoGPT
+from model.pico_model import PicoGPTConfig, PicoGPT
 from quantization import load_quantized_model, benchmark_model_inference
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Sample from tiny GPT model')
     parser.add_argument('--out_dir', type=str, default='out-tiny', help='Output directory')
     parser.add_argument('--start', type=str, default="\n", help='Initial prompt or FILE:path')
-    parser.add_argument('--num_samples', type=int, default=5, help='Number of samples to generate')
-    parser.add_argument('--max_new_tokens', type=int, default=100, help='Max new tokens to generate')
+    parser.add_argument('--num_samples', type=int, default=1, help='Number of samples to generate')
+    parser.add_argument('--max_new_tokens', type=int, default=500, help='Max new tokens to generate')
     parser.add_argument('--temperature', type=float, default=0.8, help='Sampling temperature')
     parser.add_argument('--top_k', type=int, default=200, help='Top-k sampling (None to disable)')
     parser.add_argument('--seed', type=int, default=1337, help='Random seed')
@@ -34,7 +34,7 @@ def load_model(args):
     """Load model (quantized or regular)"""
 
     # Determine paths
-    ckpt_path = os.path.join(args.out_dir, 'ckpt.pt')
+    ckpt_path = os.path.join(args.out_dir, 'ckpt_l3_h4_e192_bs32_bl128_lr3e-3_iter8k_baseline.pt')
     quantized_path = args.quantized_model_path or os.path.join(args.out_dir, 'quantized_model.pt')
 
     # Load meta information
@@ -88,11 +88,28 @@ def load_model(args):
 
         # Load state dict
         state_dict = checkpoint['model']
+
+        # Remove DDP prefix
         unwanted_prefix = '_orig_mod.'
         for k, v in list(state_dict.items()):
             if k.startswith(unwanted_prefix):
                 state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
-        model.load_state_dict(state_dict)
+
+        # Remove quantization-related parameters
+        quantization_keys = []
+        for k in state_dict.keys():
+            if any(quant_keyword in k for quant_keyword in [
+                'activation_post_process', 'weight_fake_quant', 'fake_quant_enabled',
+                'observer_enabled', 'scale', 'zero_point', 'min_val', 'max_val', 'eps'
+            ]):
+                quantization_keys.append(k)
+
+        for k in quantization_keys:
+            state_dict.pop(k)
+
+        print(f"Removed {len(quantization_keys)} quantization-related parameters")
+
+        model.load_state_dict(state_dict, strict=False)
 
         model.to(args.device)
         print("Loaded regular model successfully")
@@ -140,7 +157,6 @@ def main():
 
     # Generate samples
     print(f"\nGenerating {args.num_samples} samples...")
-    print("=" * 80)
 
     for i in range(args.num_samples):
         print(f"Sample {i+1}:")
@@ -151,8 +167,6 @@ def main():
                 y = model.generate(x, args.max_new_tokens, temperature=args.temperature, top_k=args.top_k)
                 generated_text = decode(y[0].tolist())
                 print(generated_text)
-
-        print("=" * 80)
 
     # Print model info
     print(f"\nModel info:")

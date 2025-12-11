@@ -15,7 +15,7 @@ import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
-from pico_model import PicoGPTConfig, PicoGPT
+from model.pico_model import PicoGPTConfig, PicoGPT
 from quantization import (
     setup_quantization_aware_training,
     finalize_qat_model,

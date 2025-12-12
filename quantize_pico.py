@@ -1,6 +1,8 @@
 """
-QAT (Quantization Aware Training) utilities for Pico GPT models
-Essential functions only for training and finalizing quantized models
+Quantization utilities for Pico GPT models
+- QAT (Quantization Aware Training) setup for training
+- Post-training int8 quantization for deployment
+- Model conversion and analysis utilities
 """
 
 import torch
@@ -11,6 +13,9 @@ from torch.ao.quantization.observer import MinMaxObserver, PerChannelMinMaxObser
 from torch.ao.quantization.fake_quantize import FakeQuantize
 import copy
 import os
+import argparse
+from model.pico_model import PicoGPTConfig, PicoGPT
+from model.pico_model_int8 import quantize_linear_layers_in_model
 
 def setup_quantization_aware_training(model, backend='fbgemm'):
     """
@@ -76,177 +81,97 @@ def setup_quantization_aware_training(model, backend='fbgemm'):
     print("Model ready for quantization-aware training!")
     return prepared_model
 
-def count_quantized_parameters(model):
+# =============================================================================
+# Post-Training Int8 Quantization Utilities
+# =============================================================================
+
+def quantize_model_to_int8(checkpoint_path, output_path):
     """
-    Count parameters in a quantized model, including packed parameters
+    Convert a trained model to FULL int8 quantized version for on-device deployment
 
     Args:
-        model: Quantized model
+        checkpoint_path: Path to the trained model checkpoint
+        output_path: Path to save the quantized model
 
     Returns:
-        Total parameter count
+        dict: Quantization statistics
     """
-    total_params = 0
+    print(f"Converting model to FULL int8 quantization: {checkpoint_path}")
+    print("Target: ALL linear layers (embeddings + attention + MLP)")
 
-    for name, module in model.named_modules():
-        # Only count leaf modules (those without child modules)
-        if len(list(module.children())) > 0:
-            continue
+    # Load checkpoint and create model
+    checkpoint = torch.load(checkpoint_path, map_location='cpu')
+    gptconf = PicoGPTConfig(**checkpoint['model_args'])
+    model = PicoGPT(gptconf)
 
-        # Count packed parameters from quantized linear layers
-        if hasattr(module, '_packed_params'):
-            try:
-                weight, bias = module._packed_params.unpack()
-                total_params += weight.numel()
-                if bias is not None:
-                    total_params += bias.numel()
-            except Exception as e:
-                # Fallback: try to get attributes from the quantized linear layer
-                if hasattr(module, 'in_features') and hasattr(module, 'out_features'):
-                    weight_params = module.in_features * module.out_features
-                    total_params += weight_params
-        else:
-            # Count regular parameters (embeddings, layernorms, etc.)
-            for param in module.parameters():
-                total_params += param.numel()
+    # Clean state dict of quantization artifacts
+    state_dict = checkpoint['model']
+    unwanted_prefix = '_orig_mod.'
+    quantization_keys = []
 
-    return total_params
+    for k, v in list(state_dict.items()):
+        if k.startswith(unwanted_prefix):
+            state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
+        if any(quant_keyword in k for quant_keyword in [
+            'activation_post_process', 'weight_fake_quant', 'fake_quant_enabled',
+            'observer_enabled', 'scale', 'zero_point', 'min_val', 'max_val', 'eps'
+        ]):
+            quantization_keys.append(k)
 
-def finalize_qat_model(qat_model):
-    """
-    Convert QAT model to quantized model for inference
+    for k in quantization_keys:
+        if k in state_dict:
+            state_dict.pop(k)
 
-    Args:
-        qat_model: Model trained with QAT
+    model.load_state_dict(state_dict, strict=False)
+    print(f"Loaded model with {model.get_num_params():,} parameters")
 
-    Returns:
-        Final quantized model for inference
-    """
-    print(f"Finalizing QAT model...")
-    original_param_count = sum(p.numel() for p in qat_model.parameters())
-    print(f"QAT model parameters before conversion: {original_param_count:,}")
+    # Apply FULL int8 quantization to ALL linear layers
+    quantization_stats = quantize_linear_layers_in_model(model)
 
-    qat_model.eval()
-
-    try:
-        quantized_model = quant.convert(qat_model, inplace=False)
-
-        # Use our custom parameter counting function
-        quantized_param_count = count_quantized_parameters(quantized_model)
-        regular_param_count = sum(p.numel() for p in quantized_model.parameters())
-
-        print(f"Quantized model parameters after conversion:")
-        print(f"  Regular parameters (embeddings, LayerNorm, etc.): {regular_param_count:,}")
-        print(f"  Total parameters (including packed): {quantized_param_count:,}")
-
-        param_diff = abs(original_param_count - quantized_param_count)
-        if param_diff < 15000:  # Allow reasonable difference for quantization metadata
-            print(f"✓ Parameter count preserved during quantization (diff: {param_diff:,})")
-        else:
-            print(f"⚠ Parameter count mismatch: {original_param_count:,} → {quantized_param_count:,}")
-
-        return quantized_model
-    except Exception as e:
-        print(f"Error during quantization conversion: {e}")
-        print(f"Returning original model (unquantized)")
-        return qat_model
-
-def compare_model_sizes(original_model, quantized_model):
-    """
-    Compare sizes of original and quantized models
-
-    Args:
-        original_model: Original model
-        quantized_model: Quantized model
-
-    Returns:
-        Dictionary with size comparison metrics
-    """
-    def get_model_size(model):
-        """Get model size in bytes"""
-        param_size = 0
-        buffer_size = 0
-
-        # Handle regular parameters and buffers
-        for param in model.parameters():
-            param_size += param.nelement() * param.element_size()
-        for buffer in model.buffers():
-            buffer_size += buffer.nelement() * buffer.element_size()
-
-        # Handle packed parameters in quantized models
-        for module in model.modules():
-            if hasattr(module, '_packed_params'):
-                try:
-                    weight, bias = module._packed_params.unpack()
-                    param_size += weight.nelement() * weight.element_size()
-                    if bias is not None:
-                        param_size += bias.nelement() * bias.element_size()
-                except:
-                    # Fallback estimation for packed params
-                    if hasattr(module, 'in_features') and hasattr(module, 'out_features'):
-                        # Estimate: int8 weights = 1 byte per parameter
-                        param_size += module.in_features * module.out_features * 1
-
-        return param_size + buffer_size
-
-    original_size = get_model_size(original_model)
-    quantized_size = get_model_size(quantized_model)
-    compression_ratio = original_size / quantized_size if quantized_size > 0 else 1.0
-
-    return {
-        'original_size_mb': original_size / (1024 * 1024),
-        'quantized_size_mb': quantized_size / (1024 * 1024),
-        'compression_ratio': compression_ratio,
-        'size_reduction_percent': (1 - quantized_size / original_size) * 100 if original_size > 0 else 0
+    # Save quantized model
+    save_data = {
+        'model_state_dict': model.state_dict(),
+        'quantization_stats': quantization_stats,
+        'model_args': {
+            'n_layer': 3, 'n_head': 4, 'n_embd': 192, 'block_size': 128,
+            'bias': False, 'vocab_size': 65, 'dropout': 0.0
+        },
+        'quantization_type': 'full_int8'
     }
 
-def save_quantized_model(model, path):
-    """Save quantized model"""
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    torch.save(model.state_dict(), path)
-    print(f"Quantized model saved to {path}")
+    torch.save(save_data, output_path)
+    print(f"Saved int8 quantized model to: {output_path}")
 
-def load_quantized_model(model_class, config, path, device='cpu'):
-    """Load quantized model"""
-    # Create model instance
-    model = model_class(config)
+    # Print summary
+    if '_summary' in quantization_stats:
+        summary = quantization_stats['_summary']
+        print(f"\nQuantization Summary:")
+        print(f"  Layers quantized: {summary['total_layers_quantized']}")
+        print(f"  Memory saved: {summary['total_memory_saved_bytes']/1024:.1f}KB")
+        print(f"  Compression ratio: {summary['total_compression_ratio']:.1f}x")
 
-    # Prepare for quantization to get the right structure
-    model.qconfig = QConfig(
-        activation=FakeQuantize.with_args(
-            observer=MinMaxObserver.with_args(
-                quant_min=0,
-                quant_max=127
-            ),
-            quant_min=0,
-            quant_max=127,
-            dtype=torch.quint8,
-            qscheme=torch.per_tensor_affine
-        ),
-        weight=FakeQuantize.with_args(
-            observer=PerChannelMinMaxObserver.with_args(
-                ch_axis=0,
-                quant_min=-128,
-                quant_max=127
-            ),
-            quant_min=-128,
-            quant_max=127,
-            dtype=torch.qint8,
-            qscheme=torch.per_channel_symmetric
-        )
-    )
+    return quantization_stats
 
-    # Skip embedding quantization
-    for module in model.modules():
-        if isinstance(module, nn.Embedding):
-            module.qconfig = None
 
-    prepared_model = quant.prepare_qat(model, inplace=False)
-    quantized_model = quant.convert(prepared_model, inplace=False)
+def main():
+    """Command-line interface for full int8 quantization"""
+    parser = argparse.ArgumentParser(description='Convert trained picoGPT model to FULL int8 quantized version')
+    parser.add_argument('--checkpoint', type=str, required=True,
+                       help='Path to trained model checkpoint')
+    parser.add_argument('--output', type=str, required=True,
+                       help='Output path for quantized model')
 
-    # Load state dict
-    quantized_model.load_state_dict(torch.load(path, map_location=device))
-    quantized_model.eval()
-    quantized_model.to(device)
+    args = parser.parse_args()
 
-    return quantized_model
+    print("Performing FULL int8 quantization for on-device deployment")
+    print("All linear layers (embeddings + attention + MLP) will be quantized to int8")
+
+    # Perform full quantization
+    stats = quantize_model_to_int8(args.checkpoint, args.output)
+
+    print("\n✓ FULL int8 quantization complete!")
+    print(f"Use sample_pico_int8.py to test the quantized model")
+
+
+if __name__ == "__main__":
+    main()

@@ -16,12 +16,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
 from model.pico_model import PicoGPTConfig, PicoGPT
-from quantize_pico import (
-    setup_quantization_aware_training,
-    finalize_qat_model,
-    compare_model_sizes,
-    save_quantized_model
-)
+from quantize_pico import setup_quantization_aware_training
 
 # -----------------------------------------------------------------------------
 # Configuration must be provided via config file - no defaults
@@ -284,26 +279,9 @@ while True:
     if iter_num > max_iters:
         break
 
-# QAT finalization
+# Training complete - QAT model ready for post-training quantization
 if enable_quantization and master_process:
-    print("Finalizing QAT model...")
-
-    # Get final model and convert to quantized
-    final_model = raw_model
-    quantized_model = finalize_qat_model(final_model)
-
-
-    # Compare model sizes
-    size_comparison = compare_model_sizes(final_model, quantized_model)
-    print(f"Model size comparison:")
-    print(f"  Original: {size_comparison['original_size_mb']:.2f} MB")
-    print(f"  Quantized: {size_comparison['quantized_size_mb']:.2f} MB")
-    print(f"  Compression ratio: {size_comparison['compression_ratio']:.2f}x")
-    print(f"  Size reduction: {size_comparison['size_reduction_percent']:.1f}%")
-
-    # Save quantized model to output directory
-    quantized_path = os.path.join(out_dir, 'quantized_model.pt')
-    save_quantized_model(quantized_model, quantized_path)
+    print("QAT training complete. Use quantize_pico.py for post-training int8 conversion.")
 
 if ddp:
     destroy_process_group()

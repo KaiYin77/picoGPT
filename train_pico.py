@@ -37,7 +37,7 @@ always_save_checkpoint = False
 init_from = 'scratch'
 
 # Data
-dataset = 'shakespeare_char'
+dataset = 'graham_char'
 gradient_accumulation_steps = 1
 batch_size = 32
 block_size = 128

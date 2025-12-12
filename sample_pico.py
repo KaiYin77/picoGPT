@@ -38,7 +38,7 @@ def load_model(args):
     quantized_path = args.quantized_model_path or os.path.join(args.out_dir, 'quantized_model.pt')
 
     # Load meta information
-    meta_path = os.path.join('data', 'shakespeare_char', 'meta.pkl')
+    meta_path = os.path.join('data', 'graham_char', 'meta.pkl')
     if os.path.exists(meta_path):
         with open(meta_path, 'rb') as f:
             meta = pickle.load(f)

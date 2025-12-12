@@ -12,7 +12,7 @@ eval_only = False
 always_save_checkpoint = True
 init_from = 'scratch'
 
-# Wandb logging
+# Wandb logging (set wandb_log=True to enable)
 wandb_log = False
 wandb_project = 'pico-shakespeare-char'
 wandb_run_name = 'pico-gpt-int8'
@@ -54,16 +54,25 @@ device = 'cuda' if torch.cuda.is_available() else 'cpu'
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16'
 compile = True
 
-# Quantization settings
+# Quantization settings (QAT only)
 enable_quantization = True
-quantization_mode = 'qat'  # Quantization Aware Training
 quantization_backend = 'fbgemm'
-save_quantized_model_path = None
 
-# Model size estimation:
-# Embedding: 65 * 192 = 12,480
-# Each layer: 4 * 192^2 + 3 * 192 = 147,456 + 576 = 148,032
-# Total per layer: ~148K
-# 3 layers: 3 * 148K = 444K
-# Output projection: 192 * 65 = 12,480
-# Total: ~469K parameters (within range for quantization experiments)
+# Model size estimation (actual ~923K parameters):
+# Input embedding: vocab_size * n_embd = 65 * 192 = 12,480
+# Position embedding: block_size * n_embd = 128 * 192 = 24,576
+#
+# Per transformer layer:
+#   - LayerNorm 1: n_embd = 192
+#   - Attention QKV: n_embd * (3 * n_embd) = 192 * 576 = 110,592
+#   - Attention proj: n_embd * n_embd = 192 * 192 = 36,864
+#   - LayerNorm 2: n_embd = 192
+#   - MLP fc: n_embd * (2 * n_embd) = 192 * 384 = 73,728
+#   - MLP proj: (2 * n_embd) * n_embd = 384 * 192 = 73,728
+#   - Total per layer: 110,592 + 36,864 + 73,728 + 73,728 + 384 = 295,296
+#
+# 3 transformer layers: 3 * 295,296 = 885,888
+# Output projection: n_embd * vocab_size = 192 * 65 = 12,480 (tied with input embedding)
+# Final LayerNorm: n_embd = 192
+#
+# Total: 12,480 + 24,576 + 885,888 + 192 = 923,136 parameters

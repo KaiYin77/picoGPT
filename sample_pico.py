@@ -11,7 +11,7 @@ import tiktoken
 from contextlib import nullcontext
 
 from model.pico_model import PicoGPTConfig, PicoGPT
-from quantization import load_quantized_model, benchmark_model_inference
+from quantize_pico import load_quantized_model
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Sample from tiny GPT model')
@@ -27,7 +27,6 @@ def parse_args():
     parser.add_argument('--compile', action='store_true', help='Compile model')
     parser.add_argument('--use_quantized', action='store_true', help='Use quantized model')
     parser.add_argument('--quantized_model_path', type=str, default=None, help='Path to quantized model')
-    parser.add_argument('--benchmark', action='store_true', help='Run inference benchmark')
     return parser.parse_args()
 
 def load_model(args):
@@ -147,13 +146,6 @@ def main():
 
     start_ids = encode(start)
     x = torch.tensor(start_ids, dtype=torch.long, device=args.device)[None, ...]
-
-    # Benchmark if requested
-    if args.benchmark:
-        print("\nRunning inference benchmark...")
-        avg_time = benchmark_model_inference(model, x, args.device, num_runs=100)
-        print(f"Average inference time: {avg_time:.2f} ms")
-        print(f"Tokens per second: {len(start_ids) / (avg_time / 1000):.1f}")
 
     # Generate samples
     print(f"\nGenerating {args.num_samples} samples...")

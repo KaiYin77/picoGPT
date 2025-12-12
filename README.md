@@ -3,117 +3,135 @@
 
 ![picoGPT](assets/picogpt.png)
 
-This repository now contains **Pico GPT** - a tiny quantized GPT implementation optimized for character-level text generation with int8 quantization support.
+**Pico GPT** - A minimal quantized GPT implementation optimized for character-level text generation with int8 quantization support.
 
----
+## 🚀 Quick Start
 
-**Original nanoGPT Note:** This repo was originally nanoGPT. The original implementation is preserved below, but we've added a new **Pico GPT** implementation optimized for efficient training and inference with quantization.
-
----
-
-## 🚀 Pico GPT - Quantized Tiny Transformer
-
-### Quick Start with UV
-
-1. **Setup environment with UV:**
+### 1. Setup Environment
 ```bash
-# Install uv if you don't have it
+# Install UV for modern Python package management
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
 # Install dependencies (creates virtual environment automatically)
 uv sync
 ```
 
-2. **Prepare the Shakespeare dataset:**
-```bash
-uv run python data/shakespeare_char/prepare.py
-```
+### 2. Train Pico GPT
 
-3. **Train the pico model:**
+**Shakespeare character-level model:**
 ```bash
-# Standard training
+# Prepare Shakespeare dataset
+uv run python data/shakespeare_char/prepare.py
+
+# Train with QAT (Quantization Aware Training) - default config
 uv run python train_pico.py config/train_pico_shakespeare_char.py
 
-# Quantization-aware training
-uv run python train_pico.py config/train_pico_shakespeare_char.py --enable_quantization=True --quantization_mode=qat
-
-# Post-training quantization
-uv run python train_pico.py config/train_pico_shakespeare_char.py --enable_quantization=True --quantization_mode=ptq
+# Quick test run (10 iterations)
+uv run python train_pico.py config/train_pico_shakespeare_char.py --max_iters=10
 ```
 
-4. **Sample from the trained model:**
+**Graham Essays character-level model:**
+```bash
+# Prepare Graham essays dataset (first create the dataset)
+uv run python data/graham_char/prepare.py
+
+# Train on Graham essays
+uv run python train_pico.py config/train_pico_graham_char.py
+```
+
+### 3. Sample from Trained Models
 ```bash
 # Sample from regular model
 uv run python sample_pico.py --out_dir=out-pico-shakespeare-char
 
-# Sample from quantized model
-uv run python sample_pico.py --out_dir=out-pico-shakespeare-char --use_quantized --benchmark
+# Sample from quantized int8 model
+uv run python sample_pico.py --out_dir=out-pico-shakespeare-char --use_quantized
+
+# Custom sampling
+uv run python sample_pico.py --out_dir=out-pico-shakespeare-char --use_quantized --max_new_tokens=200 --temperature=0.9
 ```
 
-### Pico GPT Architecture
+## 📊 Pico GPT Architecture
 
-The pico GPT model is designed for efficiency with ~469K parameters:
+**Compact design with ~469K parameters:**
+- **3 transformer layers**
+- **4 attention heads** per layer
+- **192 embedding dimensions**
+- **128 character context length**
+- **Character-level tokenization**
 
-- **Layers**: 3 transformer blocks
-- **Attention heads**: 4 per layer
-- **Embedding dimension**: 192
-- **Context length**: 128 characters
-- **Vocabulary**: 65 unique characters from Shakespeare
+## ⚡ Quantization Features
 
-### Quantization Features
+- **🗜️ Massive size reduction**: ~95% (from ~3.6MB to ~0.15MB)
+- **🚀 Faster inference**: Optimized int8 operations
+- **🎯 QAT training**: Quantization-aware training for optimal accuracy
+- **💾 Memory efficient**: Lower memory footprint for deployment
+- **🔧 CPU optimized**: Works well on CPU-only systems
 
-- **Model size reduction**: ~75% (from ~2MB to ~0.5MB)
-- **Inference speedup**: 2-3x faster on CPU
-- **Supports both QAT and PTQ**: Quantization-aware training and post-training quantization
-- **Memory efficiency**: Lower memory footprint for deployment
+## 📁 Key Files
 
-### Pico GPT Scripts
+- **`model/pico_model.py`**: Pico GPT model with quantization support
+- **`train_pico.py`**: Training script (config-driven, no defaults)
+- **`sample_pico.py`**: Text generation for regular and quantized models
+- **`quantize_pico.py`**: Essential QAT utilities
+- **`config/train_pico_shakespeare_char.py`**: Shakespeare training config
+- **`config/train_pico_graham_char.py`**: Graham essays training config
 
-- `pico_model.py`: Pico GPT model implementation with quantization support
-- `train_pico.py`: Training script with quantization options
-- `sample_pico.py`: Sampling script for both regular and quantized models
-- `quantization.py`: Quantization utilities and benchmarking
-- `config/train_pico_shakespeare_char.py`: Training configuration
+## 🔧 Configuration
+
+Training requires a config file (no defaults):
+```bash
+# Must specify config file
+python train_pico.py config/train_pico_shakespeare_char.py
+
+# Override config parameters
+python train_pico.py config/train_pico_shakespeare_char.py --max_iters=1000 --wandb_log=True
+```
+
+**Key config options:**
+- `enable_quantization = True` - Enable QAT training
+- `wandb_log = False` - Set to True for experiment tracking
+- `max_iters = 8000` - Training iterations
+- `device` and `dtype` - Auto-detected based on hardware
 
 ---
 
-The simplest, fastest repository for training/finetuning medium-sized GPTs. It is a rewrite of [minGPT](https://github.com/karpathy/minGPT) that prioritizes teeth over education. Still under active development, but currently the file `train.py` reproduces GPT-2 (124M) on OpenWebText, running on a single 8XA100 40GB node in about 4 days of training. The code itself is plain and readable: `train.py` is a ~300-line boilerplate training loop and `model.py` a ~300-line GPT model definition, which can optionally load the GPT-2 weights from OpenAI. That's it.
+## 🛠️ Advanced Usage
 
-![repro124m](assets/gpt2_124M_loss.png)
-
-Because the code is so simple, it is very easy to hack to your needs, train new models from scratch, or finetune pretrained checkpoints (e.g. biggest one currently available as a starting point would be the GPT-2 1.3B model from OpenAI).
-
-## install
-
-### For Pico GPT (Recommended)
-
-Use UV for modern Python package management:
-
+### Custom Dataset
+Create your own character-level dataset:
 ```bash
-# Install uv if you don't have it
-curl -LsSf https://astral.sh/uv/install.sh | sh
+# Create data/your_dataset_char/prepare.py
+# Following the shakespeare_char/prepare.py pattern
+uv run python data/your_dataset_char/prepare.py
 
-# Install dependencies (automatic virtual environment)
-uv sync
-
-# Run scripts with 'uv run python ...' (no manual activation needed)
+# Create config file for your dataset
+# Following config/train_pico_shakespeare_char.py pattern
+uv run python train_pico.py config/train_pico_your_dataset.py
 ```
 
-### For Original nanoGPT
-
+### Wandb Experiment Tracking
+```bash
+# Enable logging to Weights & Biases
+uv run python train_pico.py config/train_pico_shakespeare_char.py --wandb_log=True
 ```
-pip install torch numpy transformers datasets tiktoken wandb tqdm
-```
 
-Dependencies:
+### Hardware Optimization
+- **GPU**: Automatically uses CUDA if available with bf16/fp16 precision
+- **CPU**: Falls back to fp16 for CPU-only training
+- **Apple Silicon**: Set `--device=mps` for M1/M2 acceleration
 
-- [pytorch](https://pytorch.org) <3
-- [numpy](https://numpy.org/install/) <3
--  `transformers` for huggingface transformers <3 (to load GPT-2 checkpoints)
--  `datasets` for huggingface datasets <3 (if you want to download + preprocess OpenWebText)
--  `tiktoken` for OpenAI's fast BPE code <3
--  `wandb` for optional logging <3
--  `tqdm` for progress bars <3
+## 📦 Dependencies
+
+Managed automatically by UV:
+- **PyTorch** - Core deep learning framework
+- **NumPy** - Numerical computations
+- **Transformers** - Model architectures
+- **Datasets** - Data loading utilities
+- **TikToken** - Fast tokenization
+- **Wandb** - Experiment tracking (optional)
+- **BeautifulSoup4** - Web scraping for Graham essays
+- **html2text** - HTML to text conversion
 
 ## quick start
 

@@ -1,6 +1,6 @@
 """
 Training script for tiny GPT with int8 quantization support
-Supports both standard training and quantization-aware training (QAT)
+Supports standard training and quantization-aware training (QAT only)
 """
 
 import os
@@ -16,13 +16,11 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
 from model.pico_model import PicoGPTConfig, PicoGPT
-from quantization import (
+from quantize_pico import (
     setup_quantization_aware_training,
     finalize_qat_model,
-    post_training_quantization,
     compare_model_sizes,
-    save_quantized_model,
-    benchmark_model_inference
+    save_quantized_model
 )
 
 # -----------------------------------------------------------------------------
@@ -144,7 +142,7 @@ model.to(device)
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
 
 # Setup for quantization if enabled
-if enable_quantization and quantization_mode == 'qat':
+if enable_quantization:
     print("Setting up quantization-aware training...")
     model = setup_quantization_aware_training(model, quantization_backend)
 
@@ -196,6 +194,11 @@ def get_lr(it):
 if master_process:
     print(f"Number of parameters: {model.get_num_params() if hasattr(model, 'get_num_params') else sum(p.numel() for p in model.parameters()):,}")
 
+# Wandb logging
+if wandb_log and master_process:
+    import wandb
+    wandb.init(project=wandb_project, name=wandb_run_name, config=config)
+
 # Training loop
 X, Y = get_batch('train') # fetch the very first batch
 t0 = time.time()
@@ -217,6 +220,14 @@ while True:
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        if wandb_log:
+            wandb.log({
+                "iter": iter_num,
+                "train/loss": losses['train'],
+                "val/loss": losses['val'],
+                "lr": lr,
+                "mfu": running_mfu*100, # convert to percentage
+            })
 
         if losses['val'] < best_val_loss or always_save_checkpoint:
             best_val_loss = losses['val']
@@ -273,27 +284,14 @@ while True:
     if iter_num > max_iters:
         break
 
-# Post-training quantization or QAT finalization
+# QAT finalization
 if enable_quantization and master_process:
-    print("Applying quantization...")
+    print("Finalizing QAT model...")
 
-    # Get final model
+    # Get final model and convert to quantized
     final_model = raw_model
+    quantized_model = finalize_qat_model(final_model)
 
-    if quantization_mode == 'qat':
-        # Finalize QAT model
-        quantized_model = finalize_qat_model(final_model)
-    elif quantization_mode == 'ptq':
-        # Create calibration dataset
-        def create_calibration_dataloader():
-            calibration_data = []
-            for _ in range(100):  # 100 batches for calibration
-                X, Y = get_batch('train')
-                calibration_data.append((X, Y))
-            return calibration_data
-
-        calibration_dataloader = create_calibration_dataloader()
-        quantized_model = post_training_quantization(final_model, calibration_dataloader, quantization_backend, device)
 
     # Compare model sizes
     size_comparison = compare_model_sizes(final_model, quantized_model)
@@ -303,23 +301,9 @@ if enable_quantization and master_process:
     print(f"  Compression ratio: {size_comparison['compression_ratio']:.2f}x")
     print(f"  Size reduction: {size_comparison['size_reduction_percent']:.1f}%")
 
-    # Benchmark inference speed
-    test_input = torch.randint(0, model_args['vocab_size'], (1, block_size), device=device)
-
-    original_time = benchmark_model_inference(final_model, test_input, device)
-    quantized_time = benchmark_model_inference(quantized_model, test_input, device)
-
-    print(f"Inference speed comparison:")
-    print(f"  Original model: {original_time:.2f} ms")
-    print(f"  Quantized model: {quantized_time:.2f} ms")
-    print(f"  Speedup: {original_time/quantized_time:.2f}x")
-
-    # Save quantized model
-    if save_quantized_model_path:
-        save_quantized_model(quantized_model, save_quantized_model_path)
-    else:
-        quantized_path = os.path.join(out_dir, 'quantized_model.pt')
-        save_quantized_model(quantized_model, quantized_path)
+    # Save quantized model to output directory
+    quantized_path = os.path.join(out_dir, 'quantized_model.pt')
+    save_quantized_model(quantized_model, quantized_path)
 
 if ddp:
     destroy_process_group()

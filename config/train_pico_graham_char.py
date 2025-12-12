@@ -12,7 +12,7 @@ eval_only = False
 always_save_checkpoint = True
 init_from = 'scratch'
 
-# Wandb logging
+# Wandb logging (set wandb_log=True to enable)
 wandb_log = False
 wandb_project = 'pico-graham-char'
 wandb_run_name = 'pico-gpt-graham-int8'
@@ -54,12 +54,28 @@ device = 'cuda' if torch.cuda.is_available() else 'cpu'
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16'
 compile = True
 
-# Quantization settings
+# Quantization settings (QAT only)
 enable_quantization = True
-quantization_mode = 'qat'  # Quantization Aware Training
 quantization_backend = 'fbgemm'
-save_quantized_model_path = None
 
-# Model size estimation will depend on Graham essays vocab size
-# Expected to be larger than Shakespeare's 65 characters
-# Will be determined after data preparation
+# Model size estimation (depends on Graham essays vocab size):
+# Assuming vocab_size ~100 characters (larger than Shakespeare's 65):
+#
+# Input embedding: vocab_size * n_embd = ~100 * 192 = ~19,200
+# Position embedding: block_size * n_embd = 128 * 192 = 24,576
+#
+# Per transformer layer:
+#   - LayerNorm 1: n_embd = 192
+#   - Attention QKV: n_embd * (3 * n_embd) = 192 * 576 = 110,592
+#   - Attention proj: n_embd * n_embd = 192 * 192 = 36,864
+#   - LayerNorm 2: n_embd = 192
+#   - MLP fc: n_embd * (2 * n_embd) = 192 * 384 = 73,728
+#   - MLP proj: (2 * n_embd) * n_embd = 384 * 192 = 73,728
+#   - Total per layer: 110,592 + 36,864 + 73,728 + 73,728 + 384 = 295,296
+#
+# 3 transformer layers: 3 * 295,296 = 885,888
+# Output projection: n_embd * vocab_size = 192 * ~100 = ~19,200 (tied with input embedding)
+# Final LayerNorm: n_embd = 192
+#
+# Estimated total: ~19,200 + 24,576 + 885,888 + 192 = ~929,856 parameters
+# (Actual size will depend on final vocab_size after data preparation)

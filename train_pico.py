@@ -26,60 +26,20 @@ from quantization import (
 )
 
 # -----------------------------------------------------------------------------
-# Default config values designed for training on tiny Shakespeare
-# I/O
-out_dir = 'out-tiny'
-eval_interval = 250
-log_interval = 10
-eval_iters = 200
-eval_only = False
-always_save_checkpoint = False
-init_from = 'scratch'
-
-# Data
-dataset = 'graham_char'
-gradient_accumulation_steps = 1
-batch_size = 32
-block_size = 128
-
-# Model
-n_layer = 3
-n_head = 4
-n_embd = 192
-dropout = 0.1
-bias = False
-
-# AdamW optimizer
-learning_rate = 3e-3
-max_iters = 8000
-weight_decay = 1e-1
-beta1 = 0.9
-beta2 = 0.99
-grad_clip = 1.0
-
-# Learning rate decay
-decay_lr = True
-warmup_iters = 200
-lr_decay_iters = 8000
-min_lr = 3e-4
-
-# DDP settings
-backend = 'nccl'
-
-# System
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
-dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16'
-compile = True
-
-# Quantization settings
-enable_quantization = False
-quantization_mode = 'qat'  # 'qat' for quantization-aware training, 'ptq' for post-training quantization
-quantization_backend = 'fbgemm'
-save_quantized_model_path = None
-
+# Configuration must be provided via config file - no defaults
+# Usage: python train_pico.py config/train_pico_shakespeare_char.py
 # -----------------------------------------------------------------------------
+
+import sys
+if len(sys.argv) < 2 or sys.argv[1].startswith('--') or not sys.argv[1].endswith('.py'):
+    print("Error: Must provide a config file as first argument")
+    print("Usage: python train_pico.py config/train_pico_shakespeare_char.py")
+    print("   or: python train_pico.py config/train_pico_graham_char.py")
+    sys.exit(1)
+
+# Load configuration from file
+exec(open('configurator.py').read()) # loads config from command line args
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
-exec(open('configurator.py').read()) # overrides from command line or config file
 config = {k: globals()[k] for k in config_keys}
 # -----------------------------------------------------------------------------
 

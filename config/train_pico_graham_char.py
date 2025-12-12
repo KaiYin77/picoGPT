@@ -1,10 +1,10 @@
-# Pico GPT for character-level Shakespeare with int8 quantization
+# Pico GPT for character-level Graham Essays with int8 quantization
 # Target: ~200-300K parameters for efficient quantization
 
 import torch
 
 # I/O
-out_dir = 'out-pico-shakespeare-char'
+out_dir = 'out-pico-graham-char'
 eval_interval = 250
 log_interval = 10
 eval_iters = 200
@@ -14,18 +14,18 @@ init_from = 'scratch'
 
 # Wandb logging
 wandb_log = False
-wandb_project = 'pico-shakespeare-char'
-wandb_run_name = 'pico-gpt-int8'
+wandb_project = 'pico-graham-char'
+wandb_run_name = 'pico-gpt-graham-int8'
 
 # Data
-dataset = 'shakespeare_char'
+dataset = 'graham_char'
 gradient_accumulation_steps = 1
 batch_size = 32  # Smaller batch size for pico model
 block_size = 128  # Reduced context length
 
 # Pico GPT architecture targeting ~200K parameters
 # Formula: params ≈ vocab_size*n_embd + n_layer*(4*n_embd^2 + 3*n_embd) + n_embd*vocab_size
-# With vocab_size=65 (Shakespeare chars), this gives us ~200K params
+# Graham essays will have larger vocab than Shakespeare, so adjusting accordingly
 n_layer = 3      # 3 transformer layers
 n_head = 4       # 4 attention heads
 n_embd = 192     # 192 embedding dimensions (divisible by n_head)
@@ -60,10 +60,6 @@ quantization_mode = 'qat'  # Quantization Aware Training
 quantization_backend = 'fbgemm'
 save_quantized_model_path = None
 
-# Model size estimation:
-# Embedding: 65 * 192 = 12,480
-# Each layer: 4 * 192^2 + 3 * 192 = 147,456 + 576 = 148,032
-# Total per layer: ~148K
-# 3 layers: 3 * 148K = 444K
-# Output projection: 192 * 65 = 12,480
-# Total: ~469K parameters (within range for quantization experiments)
+# Model size estimation will depend on Graham essays vocab size
+# Expected to be larger than Shakespeare's 65 characters
+# Will be determined after data preparation

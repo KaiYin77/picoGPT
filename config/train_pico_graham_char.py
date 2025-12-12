@@ -23,14 +23,14 @@ gradient_accumulation_steps = 1
 batch_size = 32  # Smaller batch size for pico model
 block_size = 128  # Reduced context length
 
-# Pico GPT architecture targeting ~200K parameters
-# Formula: params ≈ vocab_size*n_embd + n_layer*(4*n_embd^2 + 3*n_embd) + n_embd*vocab_size
+# CIMv3-Compatible Pico GPT architecture
+# CIMv3 constraints: n_embd must be 128/256/512, d_head should be 64
 # Graham essays will have larger vocab than Shakespeare, so adjusting accordingly
 n_layer = 3      # 3 transformer layers
-n_head = 4       # 4 attention heads
-n_embd = 192     # 192 embedding dimensions (divisible by n_head)
+n_head = 2       # 2 attention heads (128 / 2 = 64 d_head - CIMv3 optimized)
+n_embd = 128     # 128 embedding dimensions (CIMv3 compatible)
 dropout = 0.1    # Light dropout for pico model
-bias = False     # Remove bias terms to reduce parameter count slightly
+bias = False     # CIMv3 prefers bias-free INT8 GEMM operations
 
 # AdamW optimizer
 learning_rate = 3e-3  # Higher LR for small model
@@ -58,24 +58,24 @@ compile = True
 enable_quantization = True
 quantization_backend = 'fbgemm'
 
-# Model size estimation (depends on Graham essays vocab size):
+# CIMv3-Compatible Model size estimation (depends on Graham essays vocab size):
 # Assuming vocab_size ~100 characters (larger than Shakespeare's 65):
 #
-# Input embedding: vocab_size * n_embd = ~100 * 192 = ~19,200
-# Position embedding: block_size * n_embd = 128 * 192 = 24,576
+# Input embedding: vocab_size * n_embd = ~100 * 128 = ~12,800
+# Position embedding: block_size * n_embd = 128 * 128 = 16,384
 #
-# Per transformer layer:
-#   - LayerNorm 1: n_embd = 192
-#   - Attention QKV: n_embd * (3 * n_embd) = 192 * 576 = 110,592
-#   - Attention proj: n_embd * n_embd = 192 * 192 = 36,864
-#   - LayerNorm 2: n_embd = 192
-#   - MLP fc: n_embd * (2 * n_embd) = 192 * 384 = 73,728
-#   - MLP proj: (2 * n_embd) * n_embd = 384 * 192 = 73,728
-#   - Total per layer: 110,592 + 36,864 + 73,728 + 73,728 + 384 = 295,296
+# Per transformer layer (CIMv3 sequence: MHA → FFN → LN2, no LN1):
+#   - Attention QKV: n_embd * (3 * n_embd) = 128 * 384 = 49,152
+#   - Attention proj: n_embd * n_embd = 128 * 128 = 16,384
+#   - MLP fc: n_embd * (2 * n_embd) = 128 * 256 = 32,768
+#   - MLP proj: (2 * n_embd) * n_embd = 256 * 128 = 32,768
+#   - LayerNorm 2: n_embd = 128
+#   - Total per layer: 49,152 + 16,384 + 32,768 + 32,768 + 128 = 131,200
 #
-# 3 transformer layers: 3 * 295,296 = 885,888
-# Output projection: n_embd * vocab_size = 192 * ~100 = ~19,200 (tied with input embedding)
-# Final LayerNorm: n_embd = 192
+# 3 transformer layers: 3 * 131,200 = 393,600
+# Output projection: tied with input embedding (0 additional params)
+# Final LayerNorm: n_embd = 128
 #
-# Estimated total: ~19,200 + 24,576 + 885,888 + 192 = ~929,856 parameters
+# Estimated total: ~12,800 + 16,384 + 393,600 + 128 = ~422,912 parameters
+# CIMv3 Features: ReLU activation, no bias, d_head=64 optimized
 # (Actual size will depend on final vocab_size after data preparation)

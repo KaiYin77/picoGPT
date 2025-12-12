@@ -63,7 +63,7 @@ uv run python train_pico.py config/train_pico_graham_char.py
 # FULL quantization - ALL linear layers (embeddings + attention + MLP)
 uv run python quantize_pico.py \
     --checkpoint out-pico-shakespeare-char/ckpt.pt \
-    --output out-pico-shakespeare-char/quantized_int8_full.pt
+    --output out-pico-shakespeare-char/ckpt_int8.pt
 ```
 
 **Quantization results:**

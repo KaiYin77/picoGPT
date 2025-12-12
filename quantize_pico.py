@@ -128,14 +128,11 @@ def quantize_model_to_int8(checkpoint_path, output_path):
     # Apply FULL int8 quantization to ALL linear layers
     quantization_stats = quantize_linear_layers_in_model(model)
 
-    # Save quantized model
+    # Save quantized model with original checkpoint's model args
     save_data = {
         'model_state_dict': model.state_dict(),
         'quantization_stats': quantization_stats,
-        'model_args': {
-            'n_layer': 3, 'n_head': 4, 'n_embd': 192, 'block_size': 128,
-            'bias': False, 'vocab_size': 65, 'dropout': 0.0
-        },
+        'model_args': checkpoint['model_args'],  # Use original model args from checkpoint
         'quantization_type': 'full_int8'
     }
 

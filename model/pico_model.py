@@ -80,30 +80,38 @@ class MLP(nn.Module):
         # Smaller expansion ratio for tiny models
         hidden_dim = 2 * config.n_embd  # 2x instead of 4x
         self.c_fc = nn.Linear(config.n_embd, hidden_dim, bias=False)
-        self.gelu = nn.GELU()
+        self.relu = nn.ReLU()  # CIMv3 only supports ReLU activation
         self.c_proj = nn.Linear(hidden_dim, config.n_embd, bias=False)
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
         x = self.c_fc(x)
-        x = self.gelu(x)
+        x = self.relu(x)
         x = self.c_proj(x)
         x = self.dropout(x)
         return x
 
 class Block(nn.Module):
-    """Transformer block"""
+    """
+    CIMv3 Hardware-Compatible Transformer block
+    Sequence: MHA → FFN → LN2 (removing pre-normalization LN1)
+    Matches CIMv3 execution: PIPE mode (MHA) → PARL mode (FFN) → LN mode
+    """
 
     def __init__(self, config):
         super().__init__()
-        self.ln_1 = LayerNorm(config.n_embd)
+        # Remove LN1 for CIMv3 hardware compatibility
         self.attn = CausalSelfAttention(config)
-        self.ln_2 = LayerNorm(config.n_embd)
         self.mlp = MLP(config)
+        # Keep only LN2 for post-FFN normalization
+        self.ln_2 = LayerNorm(config.n_embd)
 
     def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
+        # CIMv3 sequence: MHA → FFN → LN2
+        # MHA with residual connection (no pre-norm)
+        x = x + self.attn(x)
+        # FFN followed by LN2 and residual
+        x = self.ln_2(x + self.mlp(x))
         return x
 
 @dataclass
@@ -112,9 +120,35 @@ class PicoGPTConfig:
     vocab_size: int = 65  # Shakespeare character set
     n_layer: int = 3
     n_head: int = 4
-    n_embd: int = 192
+    n_embd: int = 128  # CIMv3 compatible: 128/256/512 only
     dropout: float = 0.1
     bias: bool = False
+
+    def __post_init__(self):
+        """Validate CIMv3 hardware constraints"""
+        # CIMv3 Reg #1 constraint: d_model (n_embd) must be 128, 256, or 512
+        valid_d_models = [128, 256, 512]
+        if self.n_embd not in valid_d_models:
+            raise ValueError(f"CIMv3 constraint violation: n_embd must be one of {valid_d_models}, got {self.n_embd}")
+
+        # PyTorch constraint: d_model % num_heads == 0
+        if self.n_embd % self.n_head != 0:
+            raise ValueError(f"CIMv3 constraint violation: n_embd ({self.n_embd}) must be divisible by n_head ({self.n_head})")
+
+        # CIMv3 optimized for d_head = 64
+        d_head = self.n_embd // self.n_head
+        if d_head != 64 and self.n_embd >= 256:
+            print(f"Warning: CIMv3 is optimized for d_head=64, got {d_head}. Consider adjusting n_head.")
+
+        # CIMv3 max sequence length constraint (reg.window)
+        if self.block_size > 128:
+            print(f"Warning: CIMv3 max supported seq_len is 128, got {self.block_size}. May cause hardware limitations.")
+
+        # Bias-free operations preferred for CIMv3 INT8 GEMM
+        if self.bias:
+            print("Warning: CIMv3 prefers bias=False for INT8 GEMM operations.")
+
+        print(f"CIMv3 Config Validation: ✓ d_model={self.n_embd}, n_head={self.n_head}, d_head={d_head}")
 
 class PicoGPT(nn.Module):
     """Pico GPT model optimized for int8 quantization"""

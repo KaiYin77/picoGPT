@@ -1,12 +1,35 @@
+# OS files
 .DS_Store
+
+# IDE
 .idea
-.ipynb_checkpoints/
 .vscode
+
+# Python
 __pycache__/
-*.bin
-*.pkl
-*.pt
 *.pyc
-input.txt
+.ipynb_checkpoints/
+
+# Virtual environments
 env/
 venv/
+.venv/
+
+# Data files
+*.bin
+*.pkl
+input.txt
+
+# PyTorch models
+*.pt
+out-pico-*/
+
+# TensorFlow models
+*.keras
+*.h5
+*.tflite
+out-tf-*/
+
+# Logs
+*.log
+wandb/

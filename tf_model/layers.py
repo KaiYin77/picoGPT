@@ -1,0 +1,249 @@
+"""
+Custom TensorFlow layers for PicoGPT
+Matches PyTorch implementation with CIMv3 hardware constraints
+"""
+
+import tensorflow as tf
+from .config import PicoGPTConfig
+
+
+class LayerNorm(tf.keras.layers.Layer):
+    """
+    LayerNorm without bias for parameter efficiency
+    Matches PyTorch: F.layer_norm(input, self.weight.shape, self.weight, None, 1e-5)
+    """
+
+    def __init__(self, epsilon=1e-5, **kwargs):
+        super().__init__(**kwargs)
+        self.epsilon = epsilon
+
+    def build(self, input_shape):
+        self.gamma = self.add_weight(
+            name='gamma',
+            shape=(input_shape[-1],),
+            initializer='ones',
+            trainable=True
+        )
+        super().build(input_shape)
+
+    def call(self, inputs):
+        mean = tf.reduce_mean(inputs, axis=-1, keepdims=True)
+        variance = tf.reduce_mean(tf.square(inputs - mean), axis=-1, keepdims=True)
+        # Cast epsilon to input dtype for mixed precision support
+        epsilon = tf.cast(self.epsilon, inputs.dtype)
+        normalized = (inputs - mean) / tf.sqrt(variance + epsilon)
+        return self.gamma * normalized
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({'epsilon': self.epsilon})
+        return config
+
+
+class CausalSelfAttention(tf.keras.layers.Layer):
+    """
+    Causal self-attention with combined QKV projection
+    Matches PyTorch CausalSelfAttention implementation
+    """
+
+    def __init__(self, config: PicoGPTConfig, **kwargs):
+        super().__init__(**kwargs)
+        assert config.n_embd % config.n_head == 0, "n_embd must be divisible by n_head"
+
+        # Store config parameters for serialization
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+        self.dropout_rate = config.dropout
+        self.block_size = config.block_size
+        self.bias = config.bias
+
+        # Combined QKV projection (3 * n_embd for Q, K, V)
+        self.c_attn = tf.keras.layers.Dense(
+            3 * self.n_embd,
+            use_bias=self.bias,
+            kernel_initializer=tf.keras.initializers.RandomNormal(stddev=0.02),
+            name='c_attn'
+        )
+
+        # Output projection
+        self.c_proj = tf.keras.layers.Dense(
+            self.n_embd,
+            use_bias=self.bias,
+            kernel_initializer=tf.keras.initializers.RandomNormal(stddev=0.02),
+            name='c_proj'
+        )
+
+        self.attn_dropout = tf.keras.layers.Dropout(self.dropout_rate)
+        self.resid_dropout = tf.keras.layers.Dropout(self.dropout_rate)
+
+        # Causal mask will be created in build
+        self.causal_mask = None
+
+    def build(self, input_shape):
+        # Pre-compute causal mask (lower triangular matrix)
+        # Shape: (block_size, block_size)
+        # Use compute dtype to support mixed precision
+        seq_len = self.block_size
+        compute_dtype = self.compute_dtype if hasattr(self, 'compute_dtype') else tf.float32
+        mask = tf.linalg.band_part(tf.ones((seq_len, seq_len), dtype=compute_dtype), -1, 0)
+
+        # Use add_weight with trainable=False instead of tf.Variable for better Keras 3 compatibility
+        self.causal_mask = self.add_weight(
+            name='causal_mask',
+            shape=(seq_len, seq_len),
+            dtype=compute_dtype,
+            initializer=tf.constant_initializer(mask.numpy()),
+            trainable=False
+        )
+        super().build(input_shape)
+
+    def call(self, x, training=False):
+        """
+        Args:
+            x: Input tensor of shape (B, T, C)
+            training: Whether in training mode
+
+        Returns:
+            Output tensor of shape (B, T, C)
+        """
+        # Get shapes
+        shape = tf.shape(x)
+        B = shape[0]
+        T = shape[1]
+        C = self.n_embd
+        head_dim = C // self.n_head
+
+        # QKV projection: (B, T, 3*C)
+        qkv = self.c_attn(x)
+
+        # Split into Q, K, V: each (B, T, C)
+        q, k, v = tf.split(qkv, 3, axis=-1)
+
+        # Reshape to (B, T, n_head, head_dim) then transpose to (B, n_head, T, head_dim)
+        q = tf.reshape(q, [B, T, self.n_head, head_dim])
+        q = tf.transpose(q, [0, 2, 1, 3])  # (B, n_head, T, head_dim)
+
+        k = tf.reshape(k, [B, T, self.n_head, head_dim])
+        k = tf.transpose(k, [0, 2, 1, 3])  # (B, n_head, T, head_dim)
+
+        v = tf.reshape(v, [B, T, self.n_head, head_dim])
+        v = tf.transpose(v, [0, 2, 1, 3])  # (B, n_head, T, head_dim)
+
+        # Scaled dot-product attention
+        # att = (Q @ K^T) / sqrt(head_dim)
+        # Use x.dtype to support mixed precision
+        scale = tf.cast(head_dim, x.dtype)
+        scale = tf.math.rsqrt(scale)
+
+        # (B, n_head, T, T)
+        att = tf.matmul(q, k, transpose_b=True) * scale
+
+        # Apply causal mask
+        # Use only the relevant part of the pre-computed mask
+        mask_value = tf.constant(-1e9, dtype=x.dtype)
+        causal_mask_slice = self.causal_mask[:T, :T]
+        att = tf.where(
+            causal_mask_slice == 0,
+            mask_value,
+            att
+        )
+
+        # Softmax over the last dimension (key dimension)
+        att = tf.nn.softmax(att, axis=-1)
+        att = self.attn_dropout(att, training=training)
+
+        # Weighted sum of values: (B, n_head, T, head_dim)
+        y = tf.matmul(att, v)
+
+        # Reshape back to (B, T, C)
+        y = tf.transpose(y, [0, 2, 1, 3])  # (B, T, n_head, head_dim)
+        y = tf.reshape(y, [B, T, C])
+
+        # Output projection with residual dropout
+        y = self.c_proj(y)
+        y = self.resid_dropout(y, training=training)
+
+        return y
+
+
+class MLP(tf.keras.layers.Layer):
+    """
+    Compact MLP block with 2x expansion
+    CIMv3 constraint: ReLU activation only, no bias
+    """
+
+    def __init__(self, config: PicoGPTConfig, **kwargs):
+        super().__init__(**kwargs)
+
+        # Store config parameters for serialization
+        self.n_embd = config.n_embd
+        self.bias = config.bias
+        self.dropout_rate = config.dropout
+
+        # 2x expansion for compact models (vs 4x in standard transformers)
+        hidden_dim = 2 * self.n_embd
+
+        self.c_fc = tf.keras.layers.Dense(
+            hidden_dim,
+            use_bias=self.bias,
+            kernel_initializer=tf.keras.initializers.RandomNormal(stddev=0.02),
+            name='c_fc'
+        )
+
+        self.c_proj = tf.keras.layers.Dense(
+            self.n_embd,
+            use_bias=self.bias,
+            kernel_initializer=tf.keras.initializers.RandomNormal(stddev=0.02),
+            name='c_proj'
+        )
+
+        self.dropout = tf.keras.layers.Dropout(self.dropout_rate)
+
+    def call(self, x, training=False):
+        """
+        Args:
+            x: Input tensor of shape (B, T, C)
+            training: Whether in training mode
+
+        Returns:
+            Output tensor of shape (B, T, C)
+        """
+        x = self.c_fc(x)
+        x = tf.nn.relu(x)  # CIMv3 only supports ReLU
+        x = self.c_proj(x)
+        x = self.dropout(x, training=training)
+        return x
+
+
+class Block(tf.keras.layers.Layer):
+    """
+    CIMv3-compatible transformer block
+    Architecture: MHA → FFN → LN2 (post-norm only, no LN1)
+    Residual connections around both attention and MLP
+    """
+
+    def __init__(self, config: PicoGPTConfig, layer_idx: int = 0, **kwargs):
+        super().__init__(**kwargs)
+
+        self.layer_idx = layer_idx
+        self.attn = CausalSelfAttention(config, name='attn')
+        self.mlp = MLP(config, name='mlp')
+        self.ln_2 = LayerNorm(name='ln_2')
+
+    def call(self, x, training=False):
+        """
+        Args:
+            x: Input tensor of shape (B, T, C)
+            training: Whether in training mode
+
+        Returns:
+            Output tensor of shape (B, T, C)
+        """
+        # CIMv3 sequence: MHA → FFN → LN2
+        # MHA with residual
+        x = x + self.attn(x, training=training)
+
+        # FFN with residual, then layer norm
+        x = self.ln_2(x + self.mlp(x, training=training))
+
+        return x

@@ -9,6 +9,7 @@ dependencies = [
     "matplotlib",
     "tiktoken",
     "html2text>=2024.2.26",
+    "tensorflow>=2.13.1",
 ]
 
 [tool.uv]

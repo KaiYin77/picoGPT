@@ -10,6 +10,8 @@ dependencies = [
     "tiktoken",
     "html2text>=2024.2.26",
     "tensorflow>=2.13.1",
+    "netron>=8.7.8",
+    "tflite>=2.18.0",
 ]
 
 [tool.uv]

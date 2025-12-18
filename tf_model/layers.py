@@ -142,10 +142,10 @@ class CausalSelfAttention(tf.keras.layers.Layer):
         # Use only the relevant part of the pre-computed mask
         mask_value = tf.constant(-1e9, dtype=x.dtype)
         causal_mask_slice = self.causal_mask[:T, :T]
-        att = tf.where(
-            causal_mask_slice == 0,
-            mask_value,
-            att
+        att = tf.raw_ops.SelectV2(
+            condition=causal_mask_slice == 0,
+            t=mask_value,
+            e=att,
         )
 
         # Softmax over the last dimension (key dimension)
@@ -247,3 +247,38 @@ class Block(tf.keras.layers.Layer):
         x = self.ln_2(x + self.mlp(x, training=training))
 
         return x
+
+
+class CustomEmbedding(tf.keras.layers.Layer):
+    def __init__(self, input_dim, output_dim, embeddings_initializer='uniform', **kwargs):
+        super().__init__(**kwargs)
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.embeddings_initializer = embeddings_initializer
+
+    def build(self, input_shape):
+        self.embeddings = self.add_weight(
+            name='embeddings',
+            shape=(self.input_dim, self.output_dim),
+            initializer=self.embeddings_initializer,
+            trainable=True
+        )
+        super().build(input_shape)
+
+    def call(self, inputs):
+        # inputs should be integer indices
+        return tf.gather(self.embeddings, inputs)
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            'input_dim': self.input_dim,
+            'output_dim': self.output_dim,
+            'embeddings_initializer': tf.keras.initializers.serialize(self.embeddings_initializer),
+        })
+        return config
+
+    @classmethod
+    def from_config(cls, config):
+        config['embeddings_initializer'] = tf.keras.initializers.deserialize(config['embeddings_initializer'])
+        return cls(**config)

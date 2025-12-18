@@ -4,7 +4,7 @@ Matches PyTorch architecture with weight tying and generation support
 """
 
 import tensorflow as tf
-from .layers import LayerNorm, Block
+from .layers import LayerNorm, Block, CustomEmbedding
 from .config import PicoGPTConfig
 
 
@@ -23,14 +23,14 @@ class PicoGPT(tf.keras.Model):
         self.config = config
 
         # Token embeddings (wte) and positional embeddings (wpe)
-        self.wte = tf.keras.layers.Embedding(
+        self.wte = CustomEmbedding(
             config.vocab_size,
             config.n_embd,
             embeddings_initializer=tf.keras.initializers.RandomNormal(stddev=0.02),
             name='wte'
         )
 
-        self.wpe = tf.keras.layers.Embedding(
+        self.wpe = CustomEmbedding(
             config.block_size,
             config.n_embd,
             embeddings_initializer=tf.keras.initializers.RandomNormal(stddev=0.02),
@@ -70,10 +70,10 @@ class PicoGPT(tf.keras.Model):
         T = shape[1]
 
         # Validate sequence length
-        tf.debugging.assert_less_equal(
-            T, self.config.block_size,
-            message=f"Sequence length cannot exceed block_size ({self.config.block_size})"
-        )
+        # tf.debugging.assert_less_equal(
+        #     T, self.config.block_size,
+        #     message=f"Sequence length cannot exceed block_size ({self.config.block_size})"
+        # )
 
         # Token embeddings: (B, T, n_embd)
         tok_emb = self.wte(idx)
@@ -148,10 +148,10 @@ class PicoGPT(tf.keras.Model):
 
                 # Set logits below top-k threshold to very negative value
                 # Use logits.dtype for mixed precision compatibility
-                logits = tf.where(
-                    logits < min_value,
-                    tf.constant(-1e10, dtype=logits.dtype),
-                    logits
+                logits = tf.raw_ops.SelectV2(
+                    condition=logits < min_value,
+                    t=tf.constant(-1e10, dtype=logits.dtype),
+                    e=logits,
                 )
 
             # Sample from the distribution using logits directly

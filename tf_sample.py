@@ -91,6 +91,14 @@ def main():
     # Load tokenizer (needed before building model)
     print(f"\nLoading tokenizer from {args.data_dir}...")
     tokenizer = CharacterTokenizer(args.data_dir)
+    if hasattr(model, "config") and hasattr(model.config, "vocab_size"):
+        if model.config.vocab_size != tokenizer.vocab_size:
+            print(
+                f"Error: model vocab_size ({model.config.vocab_size}) does not match "
+                f"tokenizer vocab_size ({tokenizer.vocab_size})."
+            )
+            print("Make sure --out_dir and --data_dir come from the same dataset.")
+            return
 
     # Build the model by running a dummy forward pass
     print("Building model...")

@@ -34,10 +34,18 @@ class CharacterTokenizer:
             meta = pickle.load(f)
 
         self.vocab_size = meta['vocab_size']
-        self.stoi = meta['stoi']  # string to index
-        self.itos = meta['itos']  # index to string
+        self.stoi = meta.get('stoi')  # string to index
+        self.itos = meta.get('itos')  # index to string
+        self.level = meta.get('level', 'char')
+        self.encoding = meta.get('encoding', 'latin-1')
+        self.merges = meta.get('merges')
+        self.bpe_type = meta.get('bpe_type')
+        self.sp_marker = meta.get('sp_marker')
 
-        print(f"Loaded tokenizer: vocab_size={self.vocab_size}")
+        print(
+            f"Loaded tokenizer: vocab_size={self.vocab_size}, "
+            f"level={self.level}"
+        )
 
     def encode(self, text):
         """
@@ -49,6 +57,11 @@ class CharacterTokenizer:
         Returns:
             List of integer token IDs
         """
+        if self.level == 'byte':
+            data = text.encode(self.encoding, errors='replace')
+            return list(data)
+        if self.level == 'bpe':
+            return self._encode_bpe(text)
         return [self.stoi[c] for c in text]
 
     def decode(self, tokens):
@@ -61,7 +74,42 @@ class CharacterTokenizer:
         Returns:
             Decoded string
         """
+        if self.level == 'byte':
+            return bytes(tokens).decode(self.encoding, errors='replace')
+        if self.level == 'bpe':
+            return self._decode_bpe(tokens)
         return ''.join([self.itos[i] for i in tokens])
+
+    def _merge_tokens(self, tokens, pair, new_token):
+        merged = []
+        i = 0
+        while i < len(tokens):
+            if i < len(tokens) - 1 and tokens[i] == pair[0] and tokens[i + 1] == pair[1]:
+                merged.append(new_token)
+                i += 2
+            else:
+                merged.append(tokens[i])
+                i += 1
+        return merged
+
+    def _encode_bpe(self, text):
+        if not self.merges or not self.stoi:
+            raise ValueError("BPE tokenizer missing merges or stoi")
+        if self.bpe_type == 'tiny_sp' and self.sp_marker:
+            text = text.replace(' ', self.sp_marker)
+        tokens = list(text)
+        for pair in self.merges:
+            merged_token = ''.join(pair)
+            tokens = self._merge_tokens(tokens, pair, merged_token)
+        return [self.stoi[t] for t in tokens]
+
+    def _decode_bpe(self, tokens):
+        if not self.itos:
+            raise ValueError("BPE tokenizer missing itos")
+        text = ''.join(self.itos[i] for i in tokens)
+        if self.bpe_type == 'tiny_sp' and self.sp_marker:
+            text = text.replace(self.sp_marker, ' ')
+        return text
 
 
 def create_dataset(data_dir, split='train', batch_size=32, block_size=128, shuffle=True):

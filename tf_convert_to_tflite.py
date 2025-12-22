@@ -41,7 +41,7 @@ def representative_dataset_gen(dataset, num_samples=100):
 
 
 def convert_to_tflite(
-    model_dir, output_path, quantize=True, use_representative_dataset=True
+    model_dir, output_path, quantize=True, use_representative_dataset=True, use_kv_cache=False
 ):
     """
     Convert TensorFlow model to TFLite with optional INT8 quantization
@@ -51,6 +51,7 @@ def convert_to_tflite(
         output_path: Path to save .tflite file
         quantize: Whether to apply INT8 quantization
         use_representative_dataset: Whether to use representative dataset for PTQ
+        use_kv_cache: Whether to export model with KV-cache for efficient inference
 
     Returns:
         Size of generated TFLite model in bytes
@@ -91,16 +92,66 @@ def convert_to_tflite(
 
     # Create concrete function for conversion
     # TFLite expects concrete function with fixed input signature
-    @tf.function(
-        input_signature=[tf.TensorSpec(shape=[1, config.block_size], dtype=tf.int32)]
-    )
-    def inference_fn(idx):
-        """Inference function for TFLite conversion"""
-        logits, _ = model(idx, training=False)
-        return logits
+    if use_kv_cache:
+        # KV-Cache inference: single token input + cache states
+        head_dim = config.n_embd // config.n_head
 
-    # Get concrete function
-    concrete_func = inference_fn.get_concrete_function()
+        # Build input signature: [new_token, k_cache_0, v_cache_0, ..., k_cache_N, v_cache_N, position]
+        input_sig = [tf.TensorSpec(shape=[1, 1], dtype=tf.int32, name='input_token')]
+
+        for i in range(config.n_layer):
+            input_sig.append(tf.TensorSpec(
+                shape=[1, config.n_head, config.block_size, head_dim],
+                dtype=tf.float32, name=f'k_cache_{i}'
+            ))
+            input_sig.append(tf.TensorSpec(
+                shape=[1, config.n_head, config.block_size, head_dim],
+                dtype=tf.float32, name=f'v_cache_{i}'
+            ))
+
+        input_sig.append(tf.TensorSpec(shape=[], dtype=tf.int32, name='cache_position'))
+
+        @tf.function(input_signature=input_sig)
+        def cached_inference_fn(idx, *args):
+            """Cached inference function for TFLite conversion"""
+            # Split args into k_caches, v_caches, and cache_position
+            cache_position = args[-1]
+            cache_args = args[:-1]
+
+            k_caches = []
+            v_caches = []
+            for i in range(0, len(cache_args), 2):
+                # Pass full cache tensors without slicing to avoid Range/StridedSlice ops
+                # The model will use cache_position to know the valid length
+                k_caches.append(cache_args[i])
+                v_caches.append(cache_args[i+1])
+
+            # Run cached inference
+            logits, new_k_caches, new_v_caches = model.call_with_cache(
+                idx, k_caches, v_caches, cache_position, training=False
+            )
+
+            # Prepare outputs: [logits, k_cache_0, v_cache_0, ..., k_cache_N, v_cache_N]
+            outputs = [logits]
+            for new_k, new_v in zip(new_k_caches, new_v_caches):
+                outputs.append(new_k)
+                outputs.append(new_v)
+
+            return outputs
+
+        concrete_func = cached_inference_fn.get_concrete_function()
+        print(f"[ Info] Exporting KV-cache model: {config.n_layer} layers, {config.n_head} heads")
+    else:
+        # Standard inference: full sequence input
+        @tf.function(
+            input_signature=[tf.TensorSpec(shape=[1, config.block_size], dtype=tf.int32)]
+        )
+        def inference_fn(idx):
+            """Inference function for TFLite conversion"""
+            logits, _ = model(idx, training=False)
+            return logits
+
+        concrete_func = inference_fn.get_concrete_function()
 
     # Convert to TFLite
     print("\nConverting to TFLite...")
@@ -112,7 +163,9 @@ def convert_to_tflite(
         # Enable default optimizations (weight quantization)
         converter.optimizations = [tf.lite.Optimize.DEFAULT]
 
-        if use_representative_dataset:
+        # KV-cache models: skip representative dataset (caches start empty, not meaningful for calibration)
+        # Standard models: use representative dataset for better quantization
+        if use_representative_dataset and not use_kv_cache:
             print("Loading representative dataset for calibration...")
 
             # Load dataset for calibration
@@ -142,8 +195,6 @@ def convert_to_tflite(
                 ]
 
                 # Set input/output types to INT8 for full INT8 model
-                # Note: This may fail if model has ops that don't support INT8
-                # In that case, comment out these lines for hybrid quantization
                 try:
                     converter.inference_input_type = tf.int8
                     converter.inference_output_type = tf.int8
@@ -153,6 +204,12 @@ def convert_to_tflite(
                 except Exception as e:
                     print(f"  └─ Warning: Could not set INT8 inputs/outputs: {e}")
                     print("  └─ Using hybrid quantization instead")
+        elif use_kv_cache:
+            # For KV-cache models, use default quantization parameters (no calibration needed)
+            print("  └─ KV-cache model: using default quantization (weights INT8, caches float32)")
+            print("  └─ Note: Representative dataset skipped (not applicable for stateful models)")
+        else:
+            print("  └─ Weight-only quantization (no representative dataset)")
 
     # Additional optimizations for embedded deployment
     converter.experimental_new_converter = True
@@ -198,14 +255,40 @@ def convert_to_tflite(
 
     # Test inference
     print("\nTesting inference...")
-    test_input = np.zeros((1, config.block_size), dtype=np.int32)
 
-    # Quantize input if needed
-    if input_details[0]["dtype"] == np.int8:
-        scale, zero_point = input_details[0]["quantization"]
-        test_input = (test_input / scale + zero_point).astype(np.int8)
+    if use_kv_cache:
+        # KV-cache model: set all input tensors
+        # Input signature: [token, k_cache_0, v_cache_0, ..., k_cache_N, v_cache_N, position]
+        head_dim = config.n_embd // config.n_head
 
-    interpreter.set_tensor(input_details[0]["index"], test_input)
+        # Set token input (first input)
+        test_token = np.zeros((1, 1), dtype=np.int32)
+        interpreter.set_tensor(input_details[0]["index"], test_token)
+
+        # Set cache inputs (initialize to zeros)
+        for i in range(1, len(input_details) - 1):
+            cache_shape = input_details[i]["shape"]
+            test_cache = np.zeros(cache_shape, dtype=np.float32)
+            interpreter.set_tensor(input_details[i]["index"], test_cache)
+
+        # Set position input (last input)
+        test_position = np.array(0, dtype=np.int32)
+        interpreter.set_tensor(input_details[-1]["index"], test_position)
+
+        print(f"  └─ Set {len(input_details)} input tensors (token + {len(input_details)-2} caches + position)")
+    else:
+        # Standard model: single input tensor
+        test_input = np.zeros((1, config.block_size), dtype=np.int32)
+
+        # Quantize input if needed
+        if input_details[0]["dtype"] == np.int8:
+            scale, zero_point = input_details[0]["quantization"]
+            test_input = (test_input / scale + zero_point).astype(np.int8)
+
+        interpreter.set_tensor(input_details[0]["index"], test_input)
+        print(f"  └─ Set input tensor: {test_input.shape}")
+
+    # Run inference
     interpreter.invoke()
     test_output = interpreter.get_tensor(output_details[0]["index"])
 
@@ -216,7 +299,7 @@ def convert_to_tflite(
     return tflite_model, model_size
 
 
-def write_c_array_files(tflite_model_bytes, header_path, source_path):
+def write_c_array_files(tflite_model_bytes, header_path, source_path, model_dir=None):
     """
     Converts a TFLite model into C source and header files.
 
@@ -224,6 +307,7 @@ def write_c_array_files(tflite_model_bytes, header_path, source_path):
         tflite_model_bytes (bytes): The TFLite model content.
         header_path (str): Path to save the C header file.
         source_path (str): Path to save the C source file.
+        model_dir (str): Optional model directory for config lookup.
     """
     print(f"\nConverting TFLite model to C array...")
 
@@ -237,12 +321,38 @@ def write_c_array_files(tflite_model_bytes, header_path, source_path):
             c_array_str += "\n  "
         c_array_str += f"0x{byte:02x}, "
 
-    # 2. Create header file content
+    # 2. Create header file content (with optional KV-cache config)
+    # Extract model config if available
+    config_defines = ""
+    if model_dir:
+        try:
+            # Try to load config for KV-cache model
+            import pickle
+            config_path = os.path.join(model_dir, "model_config.pkl")
+
+            if os.path.exists(config_path):
+                with open(config_path, "rb") as f:
+                    config = pickle.load(f)
+
+                # Add config defines for KV-cache support
+                config_defines = f"""
+// Model configuration for KV-cache support
+#define PICOGPT_N_LAYER {config.n_layer}
+#define PICOGPT_N_HEAD {config.n_head}
+#define PICOGPT_N_EMBD {config.n_embd}
+#define PICOGPT_HEAD_DIM ({config.n_embd} / {config.n_head})
+"""
+                print(f"  └─ Added model config: {config.n_layer} layers, {config.n_head} heads, {config.n_embd} embd")
+            else:
+                print(f"  └─ Note: Config file not found at {config_path}")
+        except Exception as e:
+            print(f"  └─ Note: Could not add model config to header: {e}")
+
     header_content = f"""
 #ifndef PICO_GPT_MODEL_DATA_H_
 #define PICO_GPT_MODEL_DATA_H_
-
-extern const unsigned char {array_variable_name}[];
+{config_defines}
+extern const unsigned char {array_variable_name}[] __attribute__((aligned(4)));
 extern const unsigned int {array_len_name};
 
 #endif // PICO_GPT_MODEL_DATA_H_
@@ -252,7 +362,7 @@ extern const unsigned int {array_len_name};
     source_content = f"""
 #include "{os.path.basename(header_path)}"
 
-const unsigned char {array_variable_name}[] = {{{c_array_str}
+const unsigned char {array_variable_name}[] __attribute__((aligned(4))) = {{{c_array_str}
 }};
 const unsigned int {array_len_name} = {len(tflite_model_bytes)};
 """
@@ -277,13 +387,13 @@ def main():
     parser.add_argument(
         "--model_dir",
         type=str,
-        default="out-tf-pico-shakespeare-char",
+        default="out-tf-sub-pico-shakespeare-tiny-bpe",
         help="Directory containing model.keras",
     )
     parser.add_argument(
         "--output",
         type=str,
-        default="out-tf-pico-shakespeare-char/model_data_int8.tflite",
+        default="out-tf-sub-pico-shakespeare-tiny-bpe/model_data_int8.tflite",
         help="Output TFLite file path",
     )
     parser.add_argument(
@@ -306,6 +416,13 @@ def main():
         default="../src/pico_gpt/model_data.cc",
         help="Output path for the C source file",
     )
+    parser.add_argument(
+        "--no_kv_cache",
+        dest="use_kv_cache",
+        action="store_false",
+        default=True,
+        help="Disable KV-cache and export standard model (default: KV-cache enabled)",
+    )
 
     args = parser.parse_args()
 
@@ -318,6 +435,7 @@ def main():
     print(
         f"Representative dataset: {'No' if args.no_representative_dataset else 'Yes'}"
     )
+    print(f"KV-Cache: {'Yes' if args.use_kv_cache else 'No'}")
     print("=" * 70 + "\n")
 
     tflite_model_bytes, model_size = convert_to_tflite(
@@ -325,10 +443,11 @@ def main():
         args.output,
         quantize=not args.no_quantize,
         use_representative_dataset=not args.no_representative_dataset,
+        use_kv_cache=args.use_kv_cache,
     )
 
     if tflite_model_bytes:
-        write_c_array_files(tflite_model_bytes, args.c_header_path, args.c_source_path)
+        write_c_array_files(tflite_model_bytes, args.c_header_path, args.c_source_path, args.model_dir)
 
 
 if __name__ == "__main__":

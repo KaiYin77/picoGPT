@@ -48,6 +48,9 @@ class PicoGPT(tf.keras.Model):
         # Final layer norm
         self.ln_f = LayerNorm(name='ln_f')
 
+        # Pre-compute positional indices to avoid tf.range
+        self.pos_indices = tf.constant(list(range(self.config.block_size)), dtype=tf.int32, name='pos_indices')
+
         # Note: No separate lm_head layer
         # Output projection uses weight tying with wte.embeddings
 
@@ -79,7 +82,7 @@ class PicoGPT(tf.keras.Model):
         tok_emb = self.wte(idx)
 
         # Position indices: (T,)
-        pos = tf.range(T, dtype=tf.int32)
+        pos = self.pos_indices[:T]
 
         # Positional embeddings: (T, n_embd)
         pos_emb = self.wpe(pos)
@@ -111,6 +114,59 @@ class PicoGPT(tf.keras.Model):
             loss = tf.reduce_mean(loss)
 
         return logits, loss
+
+    def call_with_cache(self, idx, k_caches, v_caches, cache_position, training=False):
+        """
+        Forward pass with KV-cache for efficient autoregressive generation
+
+        Args:
+            idx: Input token indices of shape (B, 1) - single new token
+            k_caches: List of K cache tensors, one per layer, shape (B, n_head, cache_len, head_dim)
+            v_caches: List of V cache tensors, one per layer, shape (B, n_head, cache_len, head_dim)
+            cache_position: Current position in sequence (scalar int)
+            training: Whether in training mode
+
+        Returns:
+            logits: Output logits of shape (B, 1, vocab_size)
+            new_k_caches: Updated K cache list
+            new_v_caches: Updated V cache list
+        """
+        # Get shape
+        shape = tf.shape(idx)
+        B = shape[0]
+        T = shape[1]  # Should be 1 for single token generation
+
+        # Token embeddings: (B, T, n_embd)
+        tok_emb = self.wte(idx)
+
+        # Positional embeddings: use cache_position as index
+        # For single token (T=1), just gather the position embedding at cache_position
+        # Reshape cache_position to be indexable
+        pos_idx = tf.reshape(cache_position, [1])
+        pos_emb = self.wpe(pos_idx)  # (1, n_embd)
+        pos_emb = tf.expand_dims(pos_emb, 0)  # (1, 1, n_embd) to match tok_emb shape
+
+        # Combine embeddings: (B, T, n_embd)
+        x = self.drop(tok_emb + pos_emb, training=training)
+
+        # Apply transformer blocks with cache
+        new_k_caches = []
+        new_v_caches = []
+        for i, block in enumerate(self.blocks):
+            x, new_k, new_v = block(x, training=training,
+                                     k_cache=k_caches[i], v_cache=v_caches[i],
+                                     cache_position=cache_position)
+            new_k_caches.append(new_k)
+            new_v_caches.append(new_v)
+
+        # Final layer norm
+        x = self.ln_f(x)
+
+        # Output projection with weight tying
+        # logits: (B, T, vocab_size)
+        logits = tf.matmul(x, self.wte.embeddings, transpose_b=True)
+
+        return logits, new_k_caches, new_v_caches
 
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
         """

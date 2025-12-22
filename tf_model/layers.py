@@ -97,14 +97,18 @@ class CausalSelfAttention(tf.keras.layers.Layer):
         )
         super().build(input_shape)
 
-    def call(self, x, training=False):
+    def call(self, x, training=False, k_cache=None, v_cache=None, cache_position=None):
         """
         Args:
             x: Input tensor of shape (B, T, C)
             training: Whether in training mode
+            k_cache: Optional cached K tensor of shape (B, n_head, cache_len, head_dim)
+            v_cache: Optional cached V tensor of shape (B, n_head, cache_len, head_dim)
+            cache_position: Optional position offset for cache usage (scalar)
 
         Returns:
-            Output tensor of shape (B, T, C)
+            If cache provided: (output, new_k_cache, new_v_cache)
+            Otherwise: output tensor of shape (B, T, C)
         """
         # Get shapes
         shape = tf.shape(x)
@@ -129,19 +133,74 @@ class CausalSelfAttention(tf.keras.layers.Layer):
         v = tf.reshape(v, [B, T, self.n_head, head_dim])
         v = tf.transpose(v, [0, 2, 1, 3])  # (B, n_head, T, head_dim)
 
+        # KV-Cache logic: if cache provided, update the cache
+        if k_cache is not None and v_cache is not None:
+            # k and v have shape (B, n_head, 1, head_dim) (current token's K, V)
+            # k_cache and v_cache have shape (B, n_head, block_size, head_dim) (full cache)
+
+            # Create indices for scatter_nd_update: [batch, head, position]
+            batch_range = tf.range(B, dtype=tf.int32) # (B,)
+            head_range = tf.range(self.n_head, dtype=tf.int32) # (n_head,)
+
+            # Create a meshgrid for batch and head indices
+            mesh_batch, mesh_head = tf.meshgrid(batch_range, head_range, indexing='ij')
+            
+            # Combine batch and head indices, then add cache_position
+            # Resulting shape will be (B, n_head, 3)
+            indices_for_scatter = tf.stack([
+                mesh_batch,
+                mesh_head,
+                tf.fill(tf.shape(mesh_batch), cache_position) # Fill with cache_position
+            ], axis=-1)
+            
+            # Reshape indices to (B * n_head, 3)
+            indices_for_scatter = tf.reshape(indices_for_scatter, [B * self.n_head, 3])
+
+            # Reshape k and v (current token's) for updates
+            # from (B, n_head, 1, head_dim) to (B * n_head, head_dim)
+            updates_k = tf.reshape(k, [B * self.n_head, head_dim])
+            updates_v = tf.reshape(v, [B * self.n_head, head_dim])
+
+            new_k_cache_full = tf.tensor_scatter_nd_update(k_cache, indices_for_scatter, updates_k)
+            new_v_cache_full = tf.tensor_scatter_nd_update(v_cache, indices_for_scatter, updates_v)
+
+            # Now, for the attention calculation itself, use the relevant part of the updated cache
+            # Keys and values for attention should be from 0 up to the current position (inclusive)
+            k = new_k_cache_full[:, :, :(cache_position + 1), :]
+            v = new_v_cache_full[:, :, :(cache_position + 1), :]
+
+            # These are the full caches to be returned by the layer
+            returned_k_cache = new_k_cache_full
+            returned_v_cache = new_v_cache_full
+
+        else:
+            returned_k_cache = k  # Not used if cache is None, but for consistency in structure
+            returned_v_cache = v
+
+
         # Scaled dot-product attention
         # att = (Q @ K^T) / sqrt(head_dim)
         # Use x.dtype to support mixed precision
         scale = tf.cast(head_dim, x.dtype)
         scale = tf.math.rsqrt(scale)
 
-        # (B, n_head, T, T)
+        # (B, n_head, T, T_total) where T_total = cache_len + T
         att = tf.matmul(q, k, transpose_b=True) * scale
 
         # Apply causal mask
         # Use only the relevant part of the pre-computed mask
         mask_value = tf.constant(-1e9, dtype=x.dtype)
-        causal_mask_slice = self.causal_mask[:T, :T]
+        T_total = tf.shape(k)[2]  # Total key length including cache
+
+        if cache_position is not None:
+            # When using cache, mask based on cache_position
+            # Query positions: [cache_position, cache_position + T)
+            # Key positions: [0, cache_position + T)
+            causal_mask_slice = self.causal_mask[cache_position:cache_position + T, :T_total]
+        else:
+            # Normal mode: use standard causal mask
+            causal_mask_slice = self.causal_mask[:T, :T_total]
+
         att = tf.raw_ops.SelectV2(
             condition=causal_mask_slice == 0,
             t=mask_value,
@@ -163,7 +222,11 @@ class CausalSelfAttention(tf.keras.layers.Layer):
         y = self.c_proj(y)
         y = self.resid_dropout(y, training=training)
 
-        return y
+        # Return cache if requested
+        if k_cache is not None and v_cache is not None:
+            return y, returned_k_cache, returned_v_cache
+        else:
+            return y
 
 
 class MLP(tf.keras.layers.Layer):
@@ -230,23 +293,35 @@ class Block(tf.keras.layers.Layer):
         self.mlp = MLP(config, name='mlp')
         self.ln_2 = LayerNorm(name='ln_2')
 
-    def call(self, x, training=False):
+    def call(self, x, training=False, k_cache=None, v_cache=None, cache_position=None):
         """
         Args:
             x: Input tensor of shape (B, T, C)
             training: Whether in training mode
+            k_cache: Optional cached K tensor for this block
+            v_cache: Optional cached V tensor for this block
+            cache_position: Optional position offset for cache usage
 
         Returns:
-            Output tensor of shape (B, T, C)
+            If cache provided: (output, new_k_cache, new_v_cache)
+            Otherwise: output tensor of shape (B, T, C)
         """
         # CIMv3 sequence: MHA → FFN → LN2
         # MHA with residual
-        x = x + self.attn(x, training=training)
+        if k_cache is not None and v_cache is not None:
+            attn_out, new_k, new_v = self.attn(x, training=training, k_cache=k_cache,
+                                                v_cache=v_cache, cache_position=cache_position)
+            x = x + attn_out
+        else:
+            x = x + self.attn(x, training=training)
 
         # FFN with residual, then layer norm
         x = self.ln_2(x + self.mlp(x, training=training))
 
-        return x
+        if k_cache is not None and v_cache is not None:
+            return x, new_k, new_v
+        else:
+            return x
 
 
 class CustomEmbedding(tf.keras.layers.Layer):

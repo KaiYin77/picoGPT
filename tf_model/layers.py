@@ -138,31 +138,21 @@ class CausalSelfAttention(tf.keras.layers.Layer):
             # k and v have shape (B, n_head, 1, head_dim) (current token's K, V)
             # k_cache and v_cache have shape (B, n_head, block_size, head_dim) (full cache)
 
-            # Create indices for scatter_nd_update: [batch, head, position]
-            batch_range = tf.range(B, dtype=tf.int32) # (B,)
-            head_range = tf.range(self.n_head, dtype=tf.int32) # (n_head,)
-
-            # Create a meshgrid for batch and head indices
-            mesh_batch, mesh_head = tf.meshgrid(batch_range, head_range, indexing='ij')
+            # Slice k_cache before the update position
+            part_before_k = k_cache[:, :, :cache_position, :]
             
-            # Combine batch and head indices, then add cache_position
-            # Resulting shape will be (B, n_head, 3)
-            indices_for_scatter = tf.stack([
-                mesh_batch,
-                mesh_head,
-                tf.fill(tf.shape(mesh_batch), cache_position) # Fill with cache_position
-            ], axis=-1)
-            
-            # Reshape indices to (B * n_head, 3)
-            indices_for_scatter = tf.reshape(indices_for_scatter, [B * self.n_head, 3])
+            # Slice k_cache after the update position
+            # This part will be empty if cache_position is at the end of the cache
+            part_after_k = k_cache[:, :, cache_position + 1:, :]
 
-            # Reshape k and v (current token's) for updates
-            # from (B, n_head, 1, head_dim) to (B * n_head, head_dim)
-            updates_k = tf.reshape(k, [B * self.n_head, head_dim])
-            updates_v = tf.reshape(v, [B * self.n_head, head_dim])
+            # Concatenate the parts with the new 'k' value
+            # tf.concat requires all inputs to have the same rank
+            new_k_cache_full = tf.concat([part_before_k, k, part_after_k], axis=2)
 
-            new_k_cache_full = tf.tensor_scatter_nd_update(k_cache, indices_for_scatter, updates_k)
-            new_v_cache_full = tf.tensor_scatter_nd_update(v_cache, indices_for_scatter, updates_v)
+            # Repeat for v_cache
+            part_before_v = v_cache[:, :, :cache_position, :]
+            part_after_v = v_cache[:, :, cache_position + 1:, :]
+            new_v_cache_full = tf.concat([part_before_v, v, part_after_v], axis=2)
 
             # Now, for the attention calculation itself, use the relevant part of the updated cache
             # Keys and values for attention should be from 0 up to the current position (inclusive)

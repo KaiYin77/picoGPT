@@ -127,45 +127,21 @@ class CausalSelfAttention(tf.keras.layers.Layer):
         q = tf.reshape(q, [B, T, self.n_head, head_dim])
         q = tf.transpose(q, [0, 2, 1, 3])  # (B, n_head, T, head_dim)
 
-        k = tf.reshape(k, [B, T, self.n_head, head_dim])
-        k = tf.transpose(k, [0, 2, 1, 3])  # (B, n_head, T, head_dim)
+        k_new = tf.reshape(k, [B, T, self.n_head, head_dim])
+        k_new = tf.transpose(k_new, [0, 2, 1, 3])
 
-        v = tf.reshape(v, [B, T, self.n_head, head_dim])
-        v = tf.transpose(v, [0, 2, 1, 3])  # (B, n_head, T, head_dim)
+        v_new = tf.reshape(v, [B, T, self.n_head, head_dim])
+        v_new = tf.transpose(v_new, [0, 2, 1, 3])
 
-        # KV-Cache logic: if cache provided, update the cache
+        # KV-Cache logic: if cache provided, use full cache for attention
         if k_cache is not None and v_cache is not None:
-            # k and v have shape (B, n_head, 1, head_dim) (current token's K, V)
-            # k_cache and v_cache have shape (B, n_head, block_size, head_dim) (full cache)
-
-            # Slice k_cache before the update position
-            part_before_k = k_cache[:, :, :cache_position, :]
-            
-            # Slice k_cache after the update position
-            # This part will be empty if cache_position is at the end of the cache
-            part_after_k = k_cache[:, :, cache_position + 1:, :]
-
-            # Concatenate the parts with the new 'k' value
-            # tf.concat requires all inputs to have the same rank
-            new_k_cache_full = tf.concat([part_before_k, k, part_after_k], axis=2)
-
-            # Repeat for v_cache
-            part_before_v = v_cache[:, :, :cache_position, :]
-            part_after_v = v_cache[:, :, cache_position + 1:, :]
-            new_v_cache_full = tf.concat([part_before_v, v, part_after_v], axis=2)
-
-            # Now, for the attention calculation itself, use the relevant part of the updated cache
-            # Keys and values for attention should be from 0 up to the current position (inclusive)
-            k = new_k_cache_full[:, :, :(cache_position + 1), :]
-            v = new_v_cache_full[:, :, :(cache_position + 1), :]
-
-            # These are the full caches to be returned by the layer
-            returned_k_cache = new_k_cache_full
-            returned_v_cache = new_v_cache_full
-
+            # Use full caches for attention calculation
+            k = k_cache
+            v = v_cache
         else:
-            returned_k_cache = k  # Not used if cache is None, but for consistency in structure
-            returned_v_cache = v
+            # No cache, use new k and v
+            k = k_new
+            v = v_new
 
 
         # Scaled dot-product attention
@@ -212,9 +188,9 @@ class CausalSelfAttention(tf.keras.layers.Layer):
         y = self.c_proj(y)
         y = self.resid_dropout(y, training=training)
 
-        # Return cache if requested
+        # Return new k and v if cache is used
         if k_cache is not None and v_cache is not None:
-            return y, returned_k_cache, returned_v_cache
+            return y, k_new, v_new
         else:
             return y
 

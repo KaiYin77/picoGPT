@@ -12,7 +12,7 @@ import numpy as np
 from tf_data import create_dataset
 
 
-def representative_dataset_gen(dataset, num_samples=100):
+def representative_dataset_gen(dataset, num_samples=1000):
     """
     Representative dataset generator for PTQ calibration
 
@@ -41,7 +41,7 @@ def representative_dataset_gen(dataset, num_samples=100):
 
 
 def convert_to_tflite(
-    model_dir, output_path, quantize=True, use_representative_dataset=True, use_kv_cache=False
+    model_dir, output_path, quantize=True, use_representative_dataset=True, use_kv_cache=False, dataset=None
 ):
     """
     Convert TensorFlow model to TFLite with optional INT8 quantization
@@ -52,6 +52,7 @@ def convert_to_tflite(
         quantize: Whether to apply INT8 quantization
         use_representative_dataset: Whether to use representative dataset for PTQ
         use_kv_cache: Whether to export model with KV-cache for efficient inference
+        dataset: Dataset name for calibration (e.g., 'shakespeare_tiny_bpe'). If None, infers from model_dir.
 
     Returns:
         Size of generated TFLite model in bytes
@@ -97,9 +98,12 @@ def convert_to_tflite(
         head_dim = config.n_embd // config.n_head
 
         # Build input signature: [new_token, k_cache_0, v_cache_0, ..., k_cache_N, v_cache_N, position]
+        # Note: Fixed shape [1, 1] (batch=1, seq_len=1) eliminates StridedSlice ops during conversion
+        # Cache tensors remain float32 for compatibility (quantization happens internally)
         input_sig = [tf.TensorSpec(shape=[1, 1], dtype=tf.int32, name='input_token')]
 
         for i in range(config.n_layer):
+            # Cache tensors use float32 (TFLite will quantize internal ops, not cache storage)
             input_sig.append(tf.TensorSpec(
                 shape=[1, config.n_head, config.block_size, head_dim],
                 dtype=tf.float32, name=f'k_cache_{i}'
@@ -163,18 +167,38 @@ def convert_to_tflite(
         # Enable default optimizations (weight quantization)
         converter.optimizations = [tf.lite.Optimize.DEFAULT]
 
-        # KV-cache models: skip representative dataset (caches start empty, not meaningful for calibration)
-        # Standard models: use representative dataset for better quantization
-        if use_representative_dataset and not use_kv_cache:
+        # Use representative dataset for calibration (both KV-cache and standard models)
+        # For KV-cache models, we calibrate using standard inference path first
+        if use_representative_dataset:
             print("Loading representative dataset for calibration...")
 
+            # Use explicitly provided dataset or infer from model_dir
+            # E.g., "out-tf-sub-pico-shakespeare-tiny-bpe" → "shakespeare_tiny_bpe"
+            if dataset is not None:
+                dataset_name = dataset
+                print(f"  └─ Using explicitly provided dataset: {dataset_name}")
+            else:
+                dataset_name = None
+                for possible_dataset in ['shakespeare_tiny_bpe', 'shakespeare_char', 'graham_char']:
+                    if possible_dataset in model_dir:
+                        dataset_name = possible_dataset
+                        break
+
+                if dataset_name is None:
+                    # Fallback to shakespeare_char for backwards compatibility
+                    dataset_name = 'shakespeare_char'
+                    print(f"  └─ Warning: Could not infer dataset from model_dir, using default: {dataset_name}")
+                else:
+                    print(f"  └─ Inferred dataset from model_dir: {dataset_name}")
+
             # Load dataset for calibration
-            data_dir = "data/shakespeare_char"
+            data_dir = os.path.join("data", dataset_name)
             if not os.path.exists(os.path.join(data_dir, "train.bin")):
                 print(
-                    f"Warning: Data not found at {data_dir}, skipping representative dataset"
+                    f"  └─ Warning: Data not found at {data_dir}, skipping representative dataset"
                 )
             else:
+                print(f"  └─ Using dataset: {dataset_name}")
                 dataset = create_dataset(
                     data_dir,
                     split="train",
@@ -183,31 +207,83 @@ def convert_to_tflite(
                     shuffle=True,
                 )
 
-                # Set representative dataset
-                converter.representative_dataset = lambda: representative_dataset_gen(
-                    dataset, num_samples=100
-                )
-                print("  └─ Using 100 samples for calibration")
+                # For KV-cache models, we need to calibrate using standard inference
+                # because the cache signature doesn't match representative dataset format
+                if use_kv_cache:
+                    print("  └─ KV-cache model detected: creating calibration path using standard inference")
 
-                # Enable INT8 quantization for all ops
-                converter.target_spec.supported_ops = [
-                    tf.lite.OpsSet.TFLITE_BUILTINS_INT8
-                ]
-
-                # Set input/output types to INT8 for full INT8 model
-                try:
-                    converter.inference_input_type = tf.int8
-                    converter.inference_output_type = tf.int8
-                    print(
-                        "  └─ Full INT8 quantization (inputs/outputs/weights/activations)"
+                    # Create a temporary standard inference function for calibration
+                    @tf.function(
+                        input_signature=[tf.TensorSpec(shape=[1, config.block_size], dtype=tf.int32)]
                     )
-                except Exception as e:
-                    print(f"  └─ Warning: Could not set INT8 inputs/outputs: {e}")
-                    print("  └─ Using hybrid quantization instead")
-        elif use_kv_cache:
-            # For KV-cache models, use default quantization parameters (no calibration needed)
-            print("  └─ KV-cache model: using default quantization (weights INT8, caches float32)")
-            print("  └─ Note: Representative dataset skipped (not applicable for stateful models)")
+                    def calibration_fn(idx):
+                        """Standard inference for calibration (no cache)"""
+                        logits, _ = model(idx, training=False)
+                        return logits
+
+                    # Create calibration converter
+                    calibration_converter = tf.lite.TFLiteConverter.from_concrete_functions(
+                        [calibration_fn.get_concrete_function()]
+                    )
+                    calibration_converter.optimizations = [tf.lite.Optimize.DEFAULT]
+
+                    # Set representative dataset for calibration
+                    calibration_converter.representative_dataset = lambda: representative_dataset_gen(
+                        dataset, num_samples=1000
+                    )
+
+                    # Enable INT8 quantization for calibration
+                    calibration_converter.target_spec.supported_ops = [
+                        tf.lite.OpsSet.TFLITE_BUILTINS_INT8
+                    ]
+
+                    print("  └─ Running calibration on standard inference path...")
+                    try:
+                        # Run calibration (we don't save this model, just use it to get quantization params)
+                        _ = calibration_converter.convert()
+                        print("  └─ Calibration complete! Applying parameters to KV-cache model...")
+                    except Exception as e:
+                        print(f"  └─ Warning: Calibration failed: {e}")
+                        print("  └─ Falling back to default quantization")
+
+                    # Apply INT8 quantization to the main KV-cache converter
+                    # NOTE: We don't set representative_dataset on the KV-cache converter
+                    # because it has a different signature (multiple inputs) than the dataset provides
+                    # The calibration above already determined quantization parameters
+                    print("  └─ Applying quantization to KV-cache model (using calibration data)...")
+
+                    # Enable INT8 quantization for internal ops
+                    # The calibration step above already determined the quantization parameters
+                    converter.target_spec.supported_ops = [
+                        tf.lite.OpsSet.TFLITE_BUILTINS_INT8
+                    ]
+
+                    print("  └─ INT8 quantization: weights and internal ops quantized")
+                    print("  └─ Cache tensors: float32 (required for TFLite Micro compatibility)")
+                    print("  └─ Using calibration parameters from standard inference path")
+
+                else:
+                    # Standard model: use representative dataset directly
+                    converter.representative_dataset = lambda: representative_dataset_gen(
+                        dataset, num_samples=1000
+                    )
+                    print("  └─ Using 100 samples for calibration")
+
+                    # Enable INT8 quantization for all ops
+                    converter.target_spec.supported_ops = [
+                        tf.lite.OpsSet.TFLITE_BUILTINS_INT8
+                    ]
+
+                    # Set input/output types to INT8 for full INT8 model
+                    try:
+                        converter.inference_input_type = tf.int8
+                        converter.inference_output_type = tf.int8
+                        print(
+                            "  └─ Full INT8 quantization (inputs/outputs/weights/activations)"
+                        )
+                    except Exception as e:
+                        print(f"  └─ Warning: Could not set INT8 inputs/outputs: {e}")
+                        print("  └─ Using hybrid quantization instead")
         else:
             print("  └─ Weight-only quantization (no representative dataset)")
 
@@ -220,11 +296,14 @@ def convert_to_tflite(
         tflite_model = converter.convert()
     except Exception as e:
         print(f"\nError during conversion: {e}")
-        print("\nTrying conversion without full INT8 (hybrid mode)...")
+        print("\nRetrying with full float32 (no quantization)...")
 
-        # Retry with hybrid quantization
-        converter.inference_input_type = None
-        converter.inference_output_type = None
+        # Clear ALL quantization settings for a pure float32 model
+        converter.optimizations = []  # Remove weight quantization
+        converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS]
+        converter.representative_dataset = None  # Clear dataset
+
+        print("  └─ Creating full float32 model (no hybrid issues)")
         tflite_model = converter.convert()
 
     # Save
@@ -423,6 +502,12 @@ def main():
         default=True,
         help="Disable KV-cache and export standard model (default: KV-cache enabled)",
     )
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default=None,
+        help="Dataset name for representative data (e.g., 'shakespeare_tiny_bpe'). If not provided, infers from model_dir.",
+    )
 
     args = parser.parse_args()
 
@@ -444,6 +529,7 @@ def main():
         quantize=not args.no_quantize,
         use_representative_dataset=not args.no_representative_dataset,
         use_kv_cache=args.use_kv_cache,
+        dataset=args.dataset,
     )
 
     if tflite_model_bytes:

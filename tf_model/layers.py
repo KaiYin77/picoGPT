@@ -99,12 +99,14 @@ class CausalSelfAttention(tf.keras.layers.Layer):
 
     def call(self, x, training=False, k_cache=None, v_cache=None, cache_position=None):
         """
+        Simplified call with minimal branching for TFLite compatibility.
+
         Args:
             x: Input tensor of shape (B, T, C)
             training: Whether in training mode
-            k_cache: Optional cached K tensor of shape (B, n_head, cache_len, head_dim)
-            v_cache: Optional cached V tensor of shape (B, n_head, cache_len, head_dim)
-            cache_position: Optional position offset for cache usage (scalar)
+            k_cache: Cached K tensor of shape (B, n_head, cache_len, head_dim) or None
+            v_cache: Cached V tensor of shape (B, n_head, cache_len, head_dim) or None
+            cache_position: Position offset for cache usage (scalar) or None
 
         Returns:
             If cache provided: (output, new_k_cache, new_v_cache)
@@ -133,63 +135,61 @@ class CausalSelfAttention(tf.keras.layers.Layer):
         v_new = tf.reshape(v, [B, T, self.n_head, head_dim])
         v_new = tf.transpose(v_new, [0, 2, 1, 3])
 
-        # KV-Cache logic: if cache provided, use full cache for attention
-        if k_cache is not None and v_cache is not None:
-            # Use full caches for attention calculation
-            k = k_cache
-            v = v_cache
-        else:
-            # No cache, use new k and v
-            k = k_new
-            v = v_new
+        # Determine if using cache (evaluated at trace time, not runtime)
+        use_cache = k_cache is not None and v_cache is not None
 
+        # Select K, V for attention (branch resolved at graph construction time)
+        k = k_cache if use_cache else k_new
+        v = v_cache if use_cache else v_new
 
         # Scaled dot-product attention
-        # att = (Q @ K^T) / sqrt(head_dim)
-        # Use x.dtype to support mixed precision
         scale = tf.cast(head_dim, x.dtype)
         scale = tf.math.rsqrt(scale)
-
-        # (B, n_head, T, T_total) where T_total = cache_len + T
         att = tf.matmul(q, k, transpose_b=True) * scale
 
-        # Apply causal mask
-        # Use only the relevant part of the pre-computed mask
+        # Apply causal mask (branch resolved at graph construction time)
         mask_value = tf.constant(-1e9, dtype=x.dtype)
-        T_total = tf.shape(k)[2]  # Total key length including cache
+        T_total = tf.shape(k)[2]
 
+        # Compute mask based on whether we're using cache
         if cache_position is not None:
-            # When using cache, mask based on cache_position
-            # Query positions: [cache_position, cache_position + T)
-            # Key positions: [0, cache_position + T)
-            causal_mask_slice = self.causal_mask[cache_position:cache_position + T, :T_total]
+            # Window-based cache path: use position-aware masking (T=1 hardcoded to avoid StridedSlice)
+            # For cache mode, T is always 1 (single token generation)
+            # K/V caches are full block_size, so we use the full row (no column slicing needed!)
+            mask_row = tf.minimum(cache_position, self.block_size - 1)
+            # Extract single row from causal mask using tf.gather (avoids StridedSlice and Range ops)
+            # Shape: (block_size,) - full row with all positions
+            mask_row_data = tf.gather(self.causal_mask, mask_row, axis=0)
+            # Expand to shape (1, block_size) to match attention weights shape
+            causal_mask_slice = tf.expand_dims(mask_row_data, axis=0)
         else:
-            # Normal mode: use standard causal mask
+            # Standard path: use normal causal mask
             causal_mask_slice = self.causal_mask[:T, :T_total]
 
+        # Apply mask
         att = tf.raw_ops.SelectV2(
             condition=causal_mask_slice == 0,
             t=mask_value,
             e=att,
         )
 
-        # Softmax over the last dimension (key dimension)
+        # Softmax and dropout
         att = tf.nn.softmax(att, axis=-1)
         att = self.attn_dropout(att, training=training)
 
-        # Weighted sum of values: (B, n_head, T, head_dim)
+        # Weighted sum of values
         y = tf.matmul(att, v)
 
         # Reshape back to (B, T, C)
-        y = tf.transpose(y, [0, 2, 1, 3])  # (B, T, n_head, head_dim)
+        y = tf.transpose(y, [0, 2, 1, 3])
         y = tf.reshape(y, [B, T, C])
 
-        # Output projection with residual dropout
+        # Output projection
         y = self.c_proj(y)
         y = self.resid_dropout(y, training=training)
 
-        # Return new k and v if cache is used
-        if k_cache is not None and v_cache is not None:
+        # Return format (branch resolved at trace time)
+        if use_cache:
             return y, k_new, v_new
         else:
             return y
@@ -261,20 +261,25 @@ class Block(tf.keras.layers.Layer):
 
     def call(self, x, training=False, k_cache=None, v_cache=None, cache_position=None):
         """
+        Simplified call with minimal branching for TFLite compatibility.
+
         Args:
             x: Input tensor of shape (B, T, C)
             training: Whether in training mode
-            k_cache: Optional cached K tensor for this block
-            v_cache: Optional cached V tensor for this block
-            cache_position: Optional position offset for cache usage
+            k_cache: Cached K tensor for this block or None
+            v_cache: Cached V tensor for this block or None
+            cache_position: Position offset for cache usage or None
 
         Returns:
             If cache provided: (output, new_k_cache, new_v_cache)
             Otherwise: output tensor of shape (B, T, C)
         """
+        # Determine if using cache (evaluated at trace time)
+        use_cache = k_cache is not None and v_cache is not None
+
         # CIMv3 sequence: MHA → FFN → LN2
         # MHA with residual
-        if k_cache is not None and v_cache is not None:
+        if use_cache:
             attn_out, new_k, new_v = self.attn(x, training=training, k_cache=k_cache,
                                                 v_cache=v_cache, cache_position=cache_position)
             x = x + attn_out
@@ -284,7 +289,8 @@ class Block(tf.keras.layers.Layer):
         # FFN with residual, then layer norm
         x = self.ln_2(x + self.mlp(x, training=training))
 
-        if k_cache is not None and v_cache is not None:
+        # Return format (branch resolved at trace time)
+        if use_cache:
             return x, new_k, new_v
         else:
             return x

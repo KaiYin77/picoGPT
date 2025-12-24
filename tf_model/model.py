@@ -131,12 +131,12 @@ class PicoGPT(tf.keras.Model):
             new_k_caches: Updated K cache list
             new_v_caches: Updated V cache list
         """
-        # Get shape
+        # Get batch size (T is hardcoded to 1 to avoid StridedSlice ops)
         shape = tf.shape(idx)
         B = shape[0]
-        T = shape[1]  # Should be 1 for single token generation
+        # T = 1 (hardcoded for single token generation, eliminates dynamic slicing)
 
-        # Token embeddings: (B, T, n_embd)
+        # Token embeddings: (B, 1, n_embd)
         tok_emb = self.wte(idx)
 
         # Positional embeddings: use cache_position as index
@@ -146,7 +146,7 @@ class PicoGPT(tf.keras.Model):
         pos_emb = self.wpe(pos_idx)  # (1, n_embd)
         pos_emb = tf.expand_dims(pos_emb, 0)  # (1, 1, n_embd) to match tok_emb shape
 
-        # Combine embeddings: (B, T, n_embd)
+        # Combine embeddings: (B, 1, n_embd)
         x = self.drop(tok_emb + pos_emb, training=training)
 
         # Apply transformer blocks with cache

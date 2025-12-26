@@ -27,7 +27,9 @@ def c_char_literal(ch):
 
 def c_string_literal(text):
     out = ['"']
-    for b in text.encode("utf-8"):
+    data = text.encode("utf-8")
+    for i, b in enumerate(data):
+        next_b = data[i + 1] if i + 1 < len(data) else None
         if b == 0x0A:
             out.append("\\n")
         elif b == 0x0D:
@@ -42,6 +44,12 @@ def c_string_literal(text):
             out.append(chr(b))
         else:
             out.append("\\x%02X" % b)
+            # Prevent \xNN from consuming following hex digits in C literals.
+            if next_b is not None:
+                is_hex = (48 <= next_b <= 57) or (65 <= next_b <= 70) or (97 <= next_b <= 102)
+                is_plain = 32 <= next_b <= 126 and next_b not in (0x5C, 0x22)
+                if is_hex and is_plain:
+                    out.append('""')
     out.append('"')
     return "".join(out)
 

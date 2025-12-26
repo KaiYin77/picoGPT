@@ -82,6 +82,19 @@ def convert_to_tflite(
     dummy_input = tf.zeros((1, config.block_size), dtype=tf.int32)
     _ = model(dummy_input, training=False)
 
+    # Also build the KV-cache path to ensure all layers are properly initialized
+    if use_kv_cache:
+        print("Building KV-cache path...")
+        head_dim = config.n_embd // config.n_head
+        dummy_token = tf.zeros((1, 1), dtype=tf.int32)
+        dummy_k_caches = [tf.zeros((1, config.n_head, config.block_size, head_dim), dtype=tf.float32)
+                          for _ in range(config.n_layer)]
+        dummy_v_caches = [tf.zeros((1, config.n_head, config.block_size, head_dim), dtype=tf.float32)
+                          for _ in range(config.n_layer)]
+        dummy_pos = tf.constant(0, dtype=tf.int32)
+        _ = model.call_with_cache(dummy_token, dummy_k_caches, dummy_v_caches, dummy_pos, training=False)
+        print("KV-cache path built successfully")
+
     # 4. Load weights
     print(f"Loading weights from {weights_path}")
     model.load_weights(weights_path)
@@ -466,22 +479,22 @@ def main():
     parser.add_argument(
         "--model_dir",
         type=str,
-        default="out-tf-sub-pico-shakespeare-tiny-bpe",
+        default="out-tf-sub-pico-tinystories-tiny-bpe",
         help="Directory containing model.keras",
     )
     parser.add_argument(
         "--output",
         type=str,
-        default="out-tf-sub-pico-shakespeare-tiny-bpe/model_data_int8.tflite",
+        default="out-tf-sub-pico-tinystories-tiny-bpe/model.tflite",
         help="Output TFLite file path",
     )
     parser.add_argument(
-        "--no_quantize", action="store_true", help="Disable quantization (FP32 model)"
+        "--quantize", action="store_true", help="Enable INT8 PTQ quantization"
     )
     parser.add_argument(
-        "--no_representative_dataset",
+        "--use_representative_dataset",
         action="store_true",
-        help="Disable representative dataset calibration",
+        help="Enable representative dataset calibration (requires --quantize)",
     )
     parser.add_argument(
         "--c_header_path",
@@ -516,9 +529,9 @@ def main():
     print("=" * 70)
     print(f"Model directory: {args.model_dir}")
     print(f"Output file: {args.output}")
-    print(f"Quantization: {'Disabled' if args.no_quantize else 'INT8 PTQ'}")
+    print(f"Quantization: {'INT8 PTQ' if args.quantize else 'Disabled'}")
     print(
-        f"Representative dataset: {'No' if args.no_representative_dataset else 'Yes'}"
+        f"Representative dataset: {'Yes' if args.use_representative_dataset else 'No'}"
     )
     print(f"KV-Cache: {'Yes' if args.use_kv_cache else 'No'}")
     print("=" * 70 + "\n")
@@ -526,8 +539,8 @@ def main():
     tflite_model_bytes, model_size = convert_to_tflite(
         args.model_dir,
         args.output,
-        quantize=not args.no_quantize,
-        use_representative_dataset=not args.no_representative_dataset,
+        quantize=args.quantize,
+        use_representative_dataset=args.use_representative_dataset,
         use_kv_cache=args.use_kv_cache,
         dataset=args.dataset,
     )

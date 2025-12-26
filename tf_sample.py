@@ -18,11 +18,11 @@ def parse_args():
     parser.add_argument(
         "--out_dir",
         type=str,
-        default="out-tf-pico-shakespeare-char",
+        default="out-tf-sub-pico-tinystories-tiny-bpe",
         help="Output directory containing trained model",
     )
     parser.add_argument(
-        "--start", type=str, default="\n", help="Start prompt for generation"
+        "--start", type=str, default="One day, ", help="Start prompt for generation"
     )
     parser.add_argument(
         "--num_samples", type=int, default=1, help="Number of samples to generate"
@@ -42,11 +42,16 @@ def parse_args():
     parser.add_argument(
         "--top_k", type=int, default=200, help="Top-k filtering (None to disable)"
     )
+    parser.add_argument(
+        "--sampling",
+        action="store_true",
+        help="Enable stochastic sampling (default: greedy decode)",
+    )
     parser.add_argument("--seed", type=int, default=1337, help="Random seed")
     parser.add_argument(
         "--data_dir",
         type=str,
-        default="data/shakespeare_char",
+        default="data/tinystories_tiny_bpe",
         help="Data directory for tokenizer",
     )
     return parser.parse_args()
@@ -99,6 +104,10 @@ def main():
             )
             print("Make sure --out_dir and --data_dir come from the same dataset.")
             return
+        if model.config.n_layer != 1:
+            print(
+                f"Warning: expected n_layer=1 for sub-pico tinystories, got {model.config.n_layer}."
+            )
 
     # Build the model by running a dummy forward pass
     print("Building model...")
@@ -117,6 +126,7 @@ def main():
     print(f"  Tokens per sample: {args.max_new_tokens}")
     print(f"  Temperature: {args.temperature}")
     print(f"  Top-k: {args.top_k}")
+    print(f"  Sampling: {'On' if args.sampling else 'Greedy'}")
     print(f"  Random seed: {args.seed}")
 
     # Encode start string
@@ -134,6 +144,7 @@ def main():
             max_new_tokens=args.max_new_tokens,
             temperature=args.temperature,
             top_k=args.top_k,
+            greedy=not args.sampling,
         )
 
         # Decode

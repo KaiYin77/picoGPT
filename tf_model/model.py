@@ -141,8 +141,10 @@ class PicoGPT(tf.keras.Model):
 
         # Positional embeddings: use cache_position as index
         # For single token (T=1), just gather the position embedding at cache_position
-        # Reshape cache_position to be indexable
+        # Clamp cache_position to block_size to prevent out-of-bounds
+        # When cache wraps around, use max position (circular KV-cache)
         pos_idx = tf.reshape(cache_position, [1])
+        pos_idx = tf.minimum(pos_idx, self.config.block_size - 1)  # Clamp to valid range
         pos_emb = self.wpe(pos_idx)  # (1, n_embd)
         pos_emb = tf.expand_dims(pos_emb, 0)  # (1, 1, n_embd) to match tok_emb shape
 
@@ -168,7 +170,7 @@ class PicoGPT(tf.keras.Model):
 
         return logits, new_k_caches, new_v_caches
 
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, greedy=False):
         """
         Generate tokens autoregressively
 
@@ -210,13 +212,17 @@ class PicoGPT(tf.keras.Model):
                     e=logits,
                 )
 
-            # Sample from the distribution using logits directly
-            # tf.random.categorical expects log-probabilities (logits)
-            idx_next = tf.random.categorical(
-                logits,
-                num_samples=1,
-                dtype=tf.int32
-            )  # (B, 1)
+            if greedy:
+                idx_next = tf.argmax(logits, axis=-1, output_type=tf.int32)
+                idx_next = tf.expand_dims(idx_next, axis=-1)
+            else:
+                # Sample from the distribution using logits directly
+                # tf.random.categorical expects log-probabilities (logits)
+                idx_next = tf.random.categorical(
+                    logits,
+                    num_samples=1,
+                    dtype=tf.int32
+                )  # (B, 1)
 
             # Append to sequence
             idx = tf.concat([idx, idx_next], axis=1)

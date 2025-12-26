@@ -76,25 +76,19 @@ class CausalSelfAttention(tf.keras.layers.Layer):
         self.attn_dropout = tf.keras.layers.Dropout(self.dropout_rate)
         self.resid_dropout = tf.keras.layers.Dropout(self.dropout_rate)
 
-        # Causal mask will be created in build
-        self.causal_mask = None
+        # Pre-compute causal and identity masks as constants to avoid tracking as weights
+        self.causal_mask = tf.constant(
+            tf.linalg.band_part(tf.ones((self.block_size, self.block_size)), -1, 0),
+            dtype=tf.float32,
+            name="causal_mask",
+        )
+        self.identity_mask = tf.constant(
+            tf.eye(self.block_size, self.block_size),
+            dtype=tf.float32,
+            name="identity_mask",
+        )
 
     def build(self, input_shape):
-        # Pre-compute causal mask (lower triangular matrix)
-        # Shape: (block_size, block_size)
-        # Use compute dtype to support mixed precision
-        seq_len = self.block_size
-        compute_dtype = self.compute_dtype if hasattr(self, 'compute_dtype') else tf.float32
-        mask = tf.linalg.band_part(tf.ones((seq_len, seq_len), dtype=compute_dtype), -1, 0)
-
-        # Use add_weight with trainable=False instead of tf.Variable for better Keras 3 compatibility
-        self.causal_mask = self.add_weight(
-            name='causal_mask',
-            shape=(seq_len, seq_len),
-            dtype=compute_dtype,
-            initializer=tf.constant_initializer(mask.numpy()),
-            trainable=False
-        )
         super().build(input_shape)
 
     def call(self, x, training=False, k_cache=None, v_cache=None, cache_position=None):
@@ -138,9 +132,23 @@ class CausalSelfAttention(tf.keras.layers.Layer):
         # Determine if using cache (evaluated at trace time, not runtime)
         use_cache = k_cache is not None and v_cache is not None
 
-        # Select K, V for attention (branch resolved at graph construction time)
-        k = k_cache if use_cache else k_new
-        v = v_cache if use_cache else v_new
+        # Select K, V for attention
+        # IMPORTANT: Use explicit tf.identity to force TFLite to use the correct tensor
+        # Python conditionals may not be properly resolved during TFLite conversion
+        if use_cache:
+            # Insert current token into cache for attention (so logits use tokens up to t)
+            # Use a precomputed identity row to avoid OneHot/Select ops.
+            pos = tf.cast(cache_position, tf.int32)
+            exact_row = tf.gather(self.identity_mask, pos, axis=0)
+            exact_mask = tf.reshape(exact_row, [1, 1, self.block_size, 1])
+            exact_mask = tf.cast(exact_mask, x.dtype)
+            k = k_cache + k_new * exact_mask
+            v = v_cache + v_new * exact_mask
+            k = tf.identity(k, name='k_from_cache_plus_new')
+            v = tf.identity(v, name='v_from_cache_plus_new')
+        else:
+            k = tf.identity(k_new, name='k_from_new')
+            v = tf.identity(v_new, name='v_from_new')
 
         # Scaled dot-product attention
         scale = tf.cast(head_dim, x.dtype)
@@ -160,18 +168,17 @@ class CausalSelfAttention(tf.keras.layers.Layer):
             # Extract single row from causal mask using tf.gather (avoids StridedSlice and Range ops)
             # Shape: (block_size,) - full row with all positions
             mask_row_data = tf.gather(self.causal_mask, mask_row, axis=0)
+            mask_row_data = tf.cast(mask_row_data, x.dtype)
             # Expand to shape (1, block_size) to match attention weights shape
             causal_mask_slice = tf.expand_dims(mask_row_data, axis=0)
         else:
             # Standard path: use normal causal mask
             causal_mask_slice = self.causal_mask[:T, :T_total]
+            causal_mask_slice = tf.cast(causal_mask_slice, x.dtype)
 
-        # Apply mask
-        att = tf.raw_ops.SelectV2(
-            condition=causal_mask_slice == 0,
-            t=mask_value,
-            e=att,
-        )
+        # Apply mask without SelectV2 (mask is 1.0 for valid positions, 0.0 for masked)
+        one = tf.constant(1.0, dtype=att.dtype)
+        att = att * causal_mask_slice + (one - causal_mask_slice) * mask_value
 
         # Softmax and dropout
         att = tf.nn.softmax(att, axis=-1)

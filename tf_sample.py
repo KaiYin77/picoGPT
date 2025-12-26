@@ -40,12 +40,12 @@ def parse_args():
         help="Sampling temperature (higher = more random)",
     )
     parser.add_argument(
-        "--top_k", type=int, default=200, help="Top-k filtering (None to disable)"
+        "--top_k", type=int, default=80, help="Top-k filtering (None to disable)"
     )
     parser.add_argument(
-        "--sampling",
+        "--greedy",
         action="store_true",
-        help="Enable stochastic sampling (default: greedy decode)",
+        help="Use greedy decode (default: sampling)",
     )
     parser.add_argument("--seed", type=int, default=1337, help="Random seed")
     parser.add_argument(
@@ -126,7 +126,7 @@ def main():
     print(f"  Tokens per sample: {args.max_new_tokens}")
     print(f"  Temperature: {args.temperature}")
     print(f"  Top-k: {args.top_k}")
-    print(f"  Sampling: {'On' if args.sampling else 'Greedy'}")
+    print(f"  Sampling: {'Greedy' if args.greedy else 'On'}")
     print(f"  Random seed: {args.seed}")
 
     # Encode start string
@@ -144,7 +144,7 @@ def main():
             max_new_tokens=args.max_new_tokens,
             temperature=args.temperature,
             top_k=args.top_k,
-            greedy=not args.sampling,
+            greedy=args.greedy,
         )
 
         # Decode

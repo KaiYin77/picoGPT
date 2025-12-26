@@ -19,10 +19,10 @@ def parse_args():
                         help="Number of tokens to generate")
     parser.add_argument("--temperature", type=float, default=0.8,
                         help="Sampling temperature")
-    parser.add_argument("--top_k", type=int, default=200,
+    parser.add_argument("--top_k", type=int, default=80,
                         help="Top-k filtering")
-    parser.add_argument("--sampling", action="store_true",
-                        help="Enable stochastic sampling (default: greedy decode)")
+    parser.add_argument("--greedy", action="store_true",
+                        help="Use greedy decode (default: sampling)")
     parser.add_argument("--seed", type=int, default=1337,
                         help="Random seed")
     parser.add_argument("--data_dir", type=str,
@@ -45,7 +45,7 @@ def main():
     print(f"Tokens: {args.max_new_tokens}")
     print(f"Temperature: {args.temperature}")
     print(f"Top-k: {args.top_k}")
-    print(f"Sampling: {'On' if args.sampling else 'Greedy'}")
+    print(f"Sampling: {'Greedy' if args.greedy else 'On'}")
     print(f"Seed: {args.seed}")
     print("="*70)
     print()
@@ -175,10 +175,10 @@ def main():
         exp_logits = np.exp(logits - np.max(logits))
         probs = exp_logits / np.sum(exp_logits)
 
-        if args.sampling:
-            next_token = np.random.choice(len(probs), p=probs)
-        else:
+        if args.greedy:
             next_token = int(np.argmax(probs))
+        else:
+            next_token = np.random.choice(len(probs), p=probs)
         generated_tokens.append(next_token)
 
         # Print token
